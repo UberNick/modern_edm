@@ -824,6 +824,27 @@ class EDMMainWindow(QMainWindow):
             station=stn,
         )
 
+    def _open_field_editor(self) -> None:
+        """Opens the visual .CFG Field Editor (frmEditField replica)."""
+        dlg = CFGFieldEditorDialog(self.cfg, self)
+        if dlg.exec() == CFGFieldEditorDialog.Accepted:
+            self._rebuild_cfg_form()
+            if self.cfg_path.suffix.lower() == ".cfg" and self.cfg_path.exists():
+                save_legacy_cfg_file(self.cfg, self.cfg_path)
+
+    def _open_button_editor(self) -> None:
+        """Opens the visual 6-Slot SpeedButton Macro Editor (frmButtons replica)."""
+        dlg = SpeedButtonEditorDialog(
+            self.cfg,
+            prisms=self.db.list_prisms(),
+            units=self.db.list_units(),
+            parent=self,
+        )
+        if dlg.exec() == SpeedButtonEditorDialog.Accepted:
+            self._rebuild_speedbuttons()
+            if self.cfg_path.suffix.lower() == ".cfg" and self.cfg_path.exists():
+                save_legacy_cfg_file(self.cfg, self.cfg_path)
+
     def _open_station_wizard(self) -> None:
         dlg = StationSetupDialog(self.db, self.driver, self)
         dlg.exec()
