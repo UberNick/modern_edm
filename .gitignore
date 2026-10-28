@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local SQLite excavation databases & WAL/SHM journals
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Spool & temporary files
+artifact_labels_spool.txt
+*.zpl
+$temp$.ini
+
+# IDE & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

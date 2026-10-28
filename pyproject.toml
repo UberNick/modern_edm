@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modern-edm"
+version = "3.3.0"
+description = "Cross-platform Total Station excavation & archaeological survey recorder with 100% EDMWin v3.2 parity."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Nick Matelli" }
+]
+dependencies = [
+    "PySide6>=6.5.0",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+modern-edm = "main:main"
