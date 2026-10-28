@@ -12,7 +12,6 @@ venv/
 env/
 
 # Local SQLite excavation databases & WAL/SHM journals
-*.sqlite
 *.sqlite-shm
 *.sqlite-wal
 *.db
