@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from drivers.total_station import SerialConfig, TotalStationDriver, create_driver
+from drivers.total_station import RawObservation, SerialConfig, TotalStationDriver, create_driver
 from storage.cfg_parser import (
     EDMConfig,
     SpeedButtonMacro,
@@ -59,11 +59,20 @@ from survey.math_engine import (
     reduce_polar_to_cartesian,
 )
 from ui.dialogs import (
+    AboutDialog,
     CFGFieldEditorDialog,
+    ContextDefaultsDialog,
+    CreateDefaultProjectDialog,
+    DataGridDialog,
+    DebugStationDialog,
     DuplicateIDDialog,
+    EDMStatusDialog,
     EntityManagerDialog,
+    FieldFilterDialog,
+    ManualShotDialog,
     OffsetPointDialog,
     SerialTerminalDialog,
+    SetupLogFilesDialog,
     SpeedButtonEditorDialog,
     StationSetupDialog,
 )
@@ -103,11 +112,16 @@ class EDMMainWindow(QMainWindow):
             stopbits=self.cfg.stopbits,
             edm_delay_time=self.cfg.edm_delay_time,
         )
-        self.driver: TotalStationDriver = create_driver(self.cfg.station_type, self.serial_config)
+        self.driver: TotalStationDriver = create_driver(
+            self.cfg.station_type, self.serial_config, log_callback=self._on_driver_serial_log
+        )
         self.field_widgets: Dict[str, QWidget] = {}
         self._active_unit_name: str = ""
         self._suppress_unit_hook: bool = False
         self.last_speech_Readout: str = ""
+        self.filter_current_station_only: bool = False
+        self.active_filter_field: Optional[str] = None
+        self.active_filter_value: Optional[str] = None
         self.label_spool_path: Path = self.db_path.parent / "artifact_labels_spool.txt"
 
         self.setWindowTitle("Modern EDM — Total Station Excavation & Survey Recorder")
@@ -141,6 +155,8 @@ class EDMMainWindow(QMainWindow):
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&File")
+        create_def_act = QAction("&Create Default CFG and MDB...", self)
+        create_def_act.triggered.connect(self._open_create_default_project)
         load_cfg_act = QAction("&Open .CFG / JSON Configuration...", self)
         load_cfg_act.triggered.connect(self._on_load_cfg)
         save_cfg_act = QAction("&Save .CFG As...", self)
@@ -154,7 +170,7 @@ class EDMMainWindow(QMainWindow):
         exp_geo_act = QAction("Export QGIS GeoJSON (Points + Lines)...", self)
         exp_geo_act.triggered.connect(self._on_export_geojson)
         file_menu.addActions([
-            load_cfg_act, save_cfg_act, exp_bundle_act, exp_csv_act, imp_csv_act, exp_geo_act
+            create_def_act, load_cfg_act, save_cfg_act, exp_bundle_act, exp_csv_act, imp_csv_act, exp_geo_act
         ])
 
         setup_menu = menubar.addMenu("&Station && Edit")
@@ -162,6 +178,10 @@ class EDMMainWindow(QMainWindow):
         edit_fields_act.triggered.connect(self._open_field_editor)
         edit_btns_act = QAction("Shot &Buttons ([BUTTON1]-[BUTTON6])...", self)
         edit_btns_act.triggered.connect(self._open_button_editor)
+        ctx_def_act = QAction("&Context Dependent Defaults...", self)
+        ctx_def_act.triggered.connect(self._open_context_defaults)
+        manual_shot_act = QAction("&Manual Shot Entry (Angles / XYZ)...", self)
+        manual_shot_act.triggered.connect(self._on_manual_shot)
         stn_act = QAction("&Initialize / Verify Station...", self)
         stn_act.triggered.connect(self._open_station_wizard)
         dat_act = QAction("Manage &Datums...", self)
@@ -174,17 +194,25 @@ class EDMMainWindow(QMainWindow):
         offset_act.triggered.connect(self._on_offset_last_point)
         com_act = QAction("&Select Total Station && COM Settings...", self)
         com_act.triggered.connect(self._open_serial_terminal)
+        debug_ts_act = QAction("&Debug Total Station...", self)
+        debug_ts_act.triggered.connect(self._open_debug_station)
+        setup_logs_act = QAction("Setup &Log Files...", self)
+        setup_logs_act.triggered.connect(self._open_setup_log_files)
         reset_conn_act = QAction("&Reset Connection", self)
         reset_conn_act.triggered.connect(self._on_reset_connection)
         setup_menu.addActions([
             edit_fields_act,
             edit_btns_act,
+            ctx_def_act,
+            manual_shot_act,
             stn_act,
             dat_act,
             prs_act,
             unt_act,
             offset_act,
             com_act,
+            debug_ts_act,
+            setup_logs_act,
             reset_conn_act,
         ])
 
@@ -209,13 +237,33 @@ class EDMMainWindow(QMainWindow):
         self.uppercase_act.setChecked(self.cfg.upper_case)
         self.uppercase_act.toggled.connect(self._on_toggle_options)
 
+        self.show_datagrid_act = QAction("Show &Data Grid...", self)
+        self.show_datagrid_act.triggered.connect(self._open_data_grid)
+
+        self.filter_grid_act = QAction("Set Grid &Filter (Field && Value)...", self)
+        self.filter_grid_act.triggered.connect(self._open_field_filter)
+
+        self.filter_station_act = QAction("Show only Points from Current &Station", self, checkable=True)
+        self.filter_station_act.setChecked(self.filter_current_station_only)
+        self.filter_station_act.toggled.connect(self._on_toggle_options)
+
         options_menu.addActions([
             self.auto_find_act,
             self.prompt_prism_act,
             self.print_labels_act,
             self.speech_act,
             self.uppercase_act,
+            self.show_datagrid_act,
+            self.filter_grid_act,
+            self.filter_station_act,
         ])
+
+        help_menu = menubar.addMenu("&Help")
+        status_act = QAction("&Status...", self)
+        status_act.triggered.connect(self._open_status_dialog)
+        about_act = QAction("&About...", self)
+        about_act.triggered.connect(self._open_about_dialog)
+        help_menu.addActions([status_act, about_act])
 
     def _on_toggle_options(self) -> None:
         self.cfg.auto_find_unit = self.auto_find_act.isChecked()
@@ -223,6 +271,8 @@ class EDMMainWindow(QMainWindow):
         self.cfg.print_labels = self.print_labels_act.isChecked()
         self.cfg.speech_enabled = self.speech_act.isChecked()
         self.cfg.upper_case = self.uppercase_act.isChecked()
+        self.filter_current_station_only = self.filter_station_act.isChecked()
+        self._refresh_all()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -276,6 +326,8 @@ class EDMMainWindow(QMainWindow):
         sec_row = QHBoxLayout()
         meas_only_btn = QPushButton("X-Shot (Measure Only)")
         meas_only_btn.clicked.connect(self._on_measure_only)
+        man_shot_btn = QPushButton("Manual Shot")
+        man_shot_btn.clicked.connect(self._on_manual_shot)
         offset_btn = QPushButton("Offset Last Pt")
         offset_btn.clicked.connect(self._on_offset_last_point)
         edit_last_btn = QPushButton("Save Edits to Last Pt")
@@ -283,6 +335,7 @@ class EDMMainWindow(QMainWindow):
         del_last_btn = QPushButton("Delete Obj")
         del_last_btn.clicked.connect(self._on_delete_last_point)
         sec_row.addWidget(meas_only_btn)
+        sec_row.addWidget(man_shot_btn)
         sec_row.addWidget(offset_btn)
         sec_row.addWidget(edit_last_btn)
         sec_row.addWidget(del_last_btn)
@@ -304,6 +357,12 @@ class EDMMainWindow(QMainWindow):
             b.clicked.connect(lambda _, m=mode_code: self.canvas.set_view_mode(m))
             plot_header.addWidget(b)
         plot_header.addStretch()
+        datagrid_btn = QPushButton("Show Data Grid")
+        datagrid_btn.clicked.connect(self._open_data_grid)
+        filter_btn = QPushButton("Filter by ...")
+        filter_btn.clicked.connect(self._open_field_filter)
+        plot_header.addWidget(datagrid_btn)
+        plot_header.addWidget(filter_btn)
         right_layout.addLayout(plot_header)
 
         self.canvas = SurveyPlotCanvas()
@@ -344,12 +403,18 @@ class EDMMainWindow(QMainWindow):
                 cb.setEditable(True)
                 cb.addItems(f.menu_items)
                 cb.setCurrentText(f.default)
+                cb.currentTextChanged.connect(
+                    lambda val, fname=f.name: self._on_master_field_changed(fname, val)
+                )
                 self.field_widgets[f.name] = cb
                 self.dynamic_form.addRow(f"{label_text}:", cb)
             else:
                 le = QLineEdit(f.default)
                 if f.length > 0:
                     le.setMaxLength(f.length)
+                le.textChanged.connect(
+                    lambda val, fname=f.name: self._on_master_field_changed(fname, val)
+                )
                 self.field_widgets[f.name] = le
                 self.dynamic_form.addRow(f"{label_text}:", le)
 
@@ -542,7 +607,12 @@ class EDMMainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Measure Failed", str(exc))
 
-    def _on_measure_and_record(self) -> None:
+    def _on_measure_and_record(
+        self,
+        _checked: bool = False,
+        manual_obs: Optional[RawObservation] = None,
+        manual_prism_height: Optional[float] = None,
+    ) -> None:
         try:
             values = self._get_form_values()
             unit_name = values.get("UNIT", "")
@@ -593,7 +663,7 @@ class EDMMainWindow(QMainWindow):
 
             # 3. Prompt for Prism if enabled (0x0042d56c: 'Verify Prism. Currently set to ...')
             prism = self._active_prism()
-            if self.cfg.prompt_prism:
+            if self.cfg.prompt_prism and manual_obs is None:
                 prisms = self.db.list_prisms()
                 prism_names = [p.name for p in prisms]
                 if prism_names:
@@ -616,9 +686,22 @@ class EDMMainWindow(QMainWindow):
                             self.prism_combo.setCurrentIndex(i)
                             break
 
-            # 4. Trigger measurement & reduce coordinates
+            if manual_prism_height is not None:
+                prism = Prism(prism.name, float(manual_prism_height), prism.offset, prism.description)
+
+            # 4. Trigger measurement (or open ManualShotDialog if station_type is MANUAL/NONE)
             stn = self.db.load_station_state()
-            obs = self.driver.measure()
+            if manual_obs is not None:
+                obs = manual_obs
+            elif self.cfg.station_type.strip().upper() in ("MANUAL", "NONE"):
+                man_dlg = ManualShotDialog(default_prism_height=prism.height, parent=self)
+                if man_dlg.exec() != ManualShotDialog.Accepted or man_dlg.observation is None:
+                    return
+                obs = man_dlg.observation
+                prism = Prism(prism.name, float(man_dlg.prism_height), prism.offset, prism.description)
+            else:
+                obs = self.driver.measure()
+
             if obs.direct_xyz is not None:
                 pt = Point3D(*obs.direct_xyz)
             else:
@@ -694,7 +777,14 @@ class EDMMainWindow(QMainWindow):
                 f"X={pt.x:.4f}  Y={pt.y:.4f}  Z={pt.z:.4f}{speech_suffix}"
             )
 
-            # 10. Advance Carry / Increment fields and persist Unit-Scoped state
+            # 10. Advance Carry / Increment fields, update Context Defaults, and persist Unit-Scoped state
+            ctx_cfg = self.db.load_context_defaults()
+            if ctx_cfg["master_var"]:
+                for k, v in values.items():
+                    if k.upper() == ctx_cfg["master_var"].upper():
+                        self.db.update_context_default_rule(v, values)
+                        break
+
             next_vals = self.cfg.apply_post_record_rules(
                 values, continue_multi_shot_sequence=is_continuation
             )
@@ -806,7 +896,12 @@ class EDMMainWindow(QMainWindow):
             if idx >= 0:
                 self.prism_combo.setCurrentIndex(idx)
 
-        pts = self.db.list_points()
+        stn_xyz = (stn.x, stn.y, stn.instrument_center_z) if self.filter_current_station_only else None
+        pts = self.db.filter_points(
+            field_name=self.active_filter_field,
+            field_value=self.active_filter_value,
+            station_xyz=stn_xyz,
+        )
         self.points_table.setRowCount(len(pts))
         for r, p in enumerate(pts):
             row_vals = [
@@ -823,6 +918,116 @@ class EDMMainWindow(QMainWindow):
             units=self.db.list_units(),
             station=stn,
         )
+
+    def _open_data_grid(self) -> None:
+        """Opens the full editable DataGrid dialog (frmDataGrid replica)."""
+        dlg = DataGridDialog(
+            self.db,
+            self.cfg,
+            filter_current_station_only=self.filter_current_station_only,
+            parent=self,
+        )
+        if self.active_filter_field and self.active_filter_value is not None:
+            dlg.apply_filter(self.active_filter_field, self.active_filter_value)
+        dlg.exec()
+        self.filter_current_station_only = dlg.filter_current_station_only
+        self.filter_station_act.setChecked(self.filter_current_station_only)
+        self.active_filter_field = dlg.active_filter_field
+        self.active_filter_value = dlg.active_filter_value
+        self._refresh_all()
+
+    def _open_field_filter(self) -> None:
+        """Opens the Field & Distinct Value filter dialog (frmFilter replica)."""
+        dlg = FieldFilterDialog(self.db, self.cfg, self)
+        if dlg.exec() == FieldFilterDialog.Accepted:
+            self.active_filter_field = dlg.selected_field
+            self.active_filter_value = dlg.selected_value
+            self._refresh_all()
+
+    def _open_context_defaults(self) -> None:
+        """Opens Context-Dependent Defaults (frmSubUnits replica)."""
+        dlg = ContextDefaultsDialog(self.db, self.cfg, self)
+        dlg.exec()
+
+    def _on_driver_serial_log(self, direction: str, payload: str) -> None:
+        """Writes total station serial traffic to TSLogFile when UseTSLog is enabled."""
+        if self.cfg.use_ts_log and self.cfg.ts_log_file:
+            SetupLogFilesDialog.append_log_entry(self.cfg.ts_log_file, f"{direction} {payload}")
+
+    def _open_setup_log_files(self) -> None:
+        """Opens Setup Log Files (frmSetupLogFiles replica)."""
+        dlg = SetupLogFilesDialog(self.cfg, default_dir=self.cfg_path.parent, parent=self)
+        if dlg.exec() == SetupLogFilesDialog.Accepted:
+            if self.cfg.use_general_log and self.cfg.general_log_file:
+                SetupLogFilesDialog.append_log_entry(
+                    self.cfg.general_log_file,
+                    f"Updated log file settings (UseTSLog={self.cfg.use_ts_log}, UseGeneralLog={self.cfg.use_general_log})",
+                )
+            if self.cfg_path.suffix.lower() == ".cfg" and self.cfg_path.exists():
+                save_legacy_cfg_file(self.cfg, self.cfg_path)
+
+    def _open_create_default_project(self) -> None:
+        """Opens Create Default CFG and MDB (frmDefault replica) and loads the created project."""
+        dlg = CreateDefaultProjectDialog(default_dir=self.cfg_path.parent, parent=self)
+        if dlg.exec() == CreateDefaultProjectDialog.Accepted and dlg.created_cfg_path and dlg.created_db_path:
+            self.db.close()
+            self.cfg_path = dlg.created_cfg_path
+            self.db_path = dlg.created_db_path
+            self.db = EDMDatabase(self.db_path)
+            self.cfg = load_cfg_file(self.cfg_path)
+            self._rebuild_cfg_form()
+            self._rebuild_speedbuttons()
+            self._refresh_all()
+
+    def _open_debug_station(self) -> None:
+        """Opens Debug Total Station (frmDebug replica)."""
+        dlg = DebugStationDialog(self.db, self.cfg, self.driver, self)
+        dlg.exec()
+
+    def _open_status_dialog(self) -> None:
+        """Opens EDM Status diagnostic summary (frmStatus replica)."""
+        dlg = EDMStatusDialog(
+            self.db,
+            self.cfg,
+            cfg_path=str(self.cfg_path),
+            ini_path=str(self.cfg_path.parent / "edm.ini"),
+            parent=self,
+        )
+        dlg.exec()
+
+    def _open_about_dialog(self) -> None:
+        """Opens About EDM (frmAbout replica)."""
+        dlg = AboutDialog(self)
+        dlg.exec()
+
+    def _on_master_field_changed(self, field_name: str, new_value: str) -> None:
+        """
+        Replicates FillDependentFields (0x0042b12c):
+        When the user changes the Master Variable on the main form, fills in
+        the saved Dependent Variable defaults for that Master Value.
+        """
+        if self._suppress_unit_hook:
+            return
+        ctx = self.db.load_context_defaults()
+        if not ctx["master_var"] or ctx["master_var"].upper() != field_name.strip().upper():
+            return
+        dep_vals = self.db.get_context_dependent_values(new_value)
+        if dep_vals:
+            self._suppress_unit_hook = True
+            try:
+                self._set_form_values(dep_vals)
+            finally:
+                self._suppress_unit_hook = False
+
+    def _on_manual_shot(self) -> None:
+        """Opens ManualShotDialog (frmManualshot replica) and records the point."""
+        prism = self._active_prism()
+        dlg = ManualShotDialog(default_prism_height=prism.height, parent=self)
+        if dlg.exec() == ManualShotDialog.Accepted and dlg.observation is not None:
+            self._on_measure_and_record(
+                manual_obs=dlg.observation,
+                manual_prism_height=dlg.prism_height,
+            )
 
     def _open_field_editor(self) -> None:
         """Opens the visual .CFG Field Editor (frmEditField replica)."""
@@ -925,3 +1130,4 @@ class EDMMainWindow(QMainWindow):
         if path:
             self.db.export_geojson(path)
             QMessageBox.information(self, "GeoJSON Export Complete", f"Exported QGIS GeoJSON to {path}")
+

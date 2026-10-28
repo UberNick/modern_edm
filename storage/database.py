@@ -120,6 +120,16 @@ class EDMDatabase:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_defaults (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                master_var TEXT NOT NULL DEFAULT '',
+                slave_vars_json TEXT NOT NULL DEFAULT '[]',
+                rules_json TEXT NOT NULL DEFAULT '{}'
+            );
+            """
+        )
         self.conn.commit()
 
         if not self.list_datums():
@@ -496,6 +506,202 @@ class EDMDatabase:
         pts = self.list_points()
         return pts[-1] if pts else None
 
+    def get_distinct_field_values(self, field_name: str) -> List[str]:
+        """
+        Replicates 'select distinct [<field>] from [<PointTable>]' in frmFilter (0x00437f9c):
+        Returns sorted distinct non-empty string representations for any core column or custom .CFG field.
+        """
+        fname_upper = field_name.strip().upper()
+        core_map = {
+            "RECNO": "doc_id",
+            "DOC_ID": "doc_id",
+            "UNIT": "unit",
+            "ID": "id",
+            "SUFFIX": "suffix",
+            "X": "x",
+            "Y": "y",
+            "Z": "z",
+            "PRISM": "prism_name",
+            "PRISM_NAME": "prism_name",
+            "PRISM_HT": "prism_height",
+            "PRISM_HEIGHT": "prism_height",
+            "PRISM_OFFSET": "prism_offset",
+            "SLOPED": "slope_dist",
+            "SLOPE_DIST": "slope_dist",
+            "HANGLE": "h_angle_deg",
+            "H_ANGLE_DEG": "h_angle_deg",
+            "VANGLE": "v_angle_deg",
+            "V_ANGLE_DEG": "v_angle_deg",
+            "STATION_X": "station_x",
+            "STATION_Y": "station_y",
+            "STATION_Z": "station_z",
+            "TIMESTAMP": "timestamp",
+        }
+        vals: set[str] = set()
+        for p in self.list_points():
+            if fname_upper in core_map:
+                raw = p.get(core_map[fname_upper], "")
+                if isinstance(raw, float):
+                    s = f"{raw:.4f}"
+                else:
+                    s = str(raw).strip()
+            else:
+                extra = p.get("extra_fields", {})
+                s = ""
+                for k, v in extra.items():
+                    if k.upper() == fname_upper:
+                        s = str(v).strip()
+                        break
+            if s:
+                vals.add(s)
+        return sorted(vals)
+
+    def filter_points(
+        self,
+        field_name: Optional[str] = None,
+        field_value: Optional[str] = None,
+        station_xyz: Optional[Tuple[float, float, float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filters recorded points by (field_name == field_value) and/or by Current Station coordinates
+        (replicating mnuFilter 'Show only Points from Current Station' @ 0x0041103a and frmFilter @ 0x00439638).
+        """
+        pts = self.list_points()
+        if station_xyz is not None:
+            sx, sy, sz = station_xyz
+            pts = [
+                p for p in pts
+                if abs(float(p.get("station_x", 0.0)) - sx) < 1e-3
+                and abs(float(p.get("station_y", 0.0)) - sy) < 1e-3
+                and abs(float(p.get("station_z", 0.0)) - sz) < 1e-3
+            ]
+
+        if not field_name or field_value is None:
+            return pts
+
+        fname_upper = field_name.strip().upper()
+        target_val = str(field_value).strip().upper()
+        core_map = {
+            "RECNO": "doc_id",
+            "DOC_ID": "doc_id",
+            "UNIT": "unit",
+            "ID": "id",
+            "SUFFIX": "suffix",
+            "X": "x",
+            "Y": "y",
+            "Z": "z",
+            "PRISM": "prism_name",
+            "PRISM_NAME": "prism_name",
+            "PRISM_HT": "prism_height",
+            "SLOPED": "slope_dist",
+            "SLOPE_DIST": "slope_dist",
+            "HANGLE": "h_angle_deg",
+            "VANGLE": "v_angle_deg",
+            "TIMESTAMP": "timestamp",
+        }
+
+        filtered: List[Dict[str, Any]] = []
+        for p in pts:
+            if fname_upper in core_map:
+                raw = p.get(core_map[fname_upper], "")
+                s = f"{raw:.4f}" if isinstance(raw, float) else str(raw).strip()
+            else:
+                extra = p.get("extra_fields", {})
+                s = ""
+                for k, v in extra.items():
+                    if k.upper() == fname_upper:
+                        s = str(v).strip()
+                        break
+            if s.upper() == target_val:
+                filtered.append(p)
+        return filtered
+
+    def update_point_cell(self, doc_id: int, column_name: str, new_value: Any) -> None:
+        """
+        Inline-updates any core column or custom .CFG extra field for a given point record
+        (replicating MSDataGrid inline cell editing on frmDataGrid @ 0x0043b8f4).
+        """
+        target = self.conn.execute(
+            "SELECT * FROM points WHERE doc_id = ?;", (doc_id,)
+        ).fetchone()
+        if not target:
+            raise ValueError("Record not found")
+
+        col_upper = column_name.strip().upper()
+        extra = json.loads(target["extra_fields_json"] or "{}")
+
+        with self.conn:
+            if col_upper == "UNIT":
+                val_str = str(new_value).strip()
+                extra["UNIT"] = val_str
+                self.conn.execute(
+                    "UPDATE points SET unit = ?, extra_fields_json = ? WHERE doc_id = ?;",
+                    (val_str, json.dumps(extra), doc_id),
+                )
+            elif col_upper == "ID":
+                val_str = str(new_value).strip()
+                extra["ID"] = val_str
+                self.conn.execute(
+                    "UPDATE points SET id = ?, extra_fields_json = ? WHERE doc_id = ?;",
+                    (val_str, json.dumps(extra), doc_id),
+                )
+            elif col_upper == "SUFFIX":
+                suf_int = int(float(str(new_value).strip() or "0"))
+                extra["SUFFIX"] = str(suf_int)
+                self.conn.execute(
+                    "UPDATE points SET suffix = ?, extra_fields_json = ? WHERE doc_id = ?;",
+                    (suf_int, json.dumps(extra), doc_id),
+                )
+            elif col_upper in ("X", "Y", "Z"):
+                f_val = float(str(new_value).strip())
+                col_sql = col_upper.lower()
+                self.conn.execute(
+                    f"UPDATE points SET {col_sql} = ? WHERE doc_id = ?;",
+                    (f_val, doc_id),
+                )
+            elif col_upper in ("PRISM", "PRISM_NAME"):
+                val_str = str(new_value).strip()
+                extra["PRISM"] = val_str
+                self.conn.execute(
+                    "UPDATE points SET prism_name = ?, extra_fields_json = ? WHERE doc_id = ?;",
+                    (val_str, json.dumps(extra), doc_id),
+                )
+            elif col_upper in ("PRISM_HT", "PRISM_HEIGHT"):
+                f_val = float(str(new_value).strip())
+                self.conn.execute(
+                    "UPDATE points SET prism_height = ? WHERE doc_id = ?;",
+                    (f_val, doc_id),
+                )
+            elif col_upper in ("SLOPED", "SLOPE_DIST"):
+                f_val = float(str(new_value).strip())
+                self.conn.execute(
+                    "UPDATE points SET slope_dist = ? WHERE doc_id = ?;",
+                    (f_val, doc_id),
+                )
+            elif col_upper in ("HANGLE", "H_ANGLE", "H_ANGLE_DEG"):
+                f_val = float(str(new_value).strip())
+                self.conn.execute(
+                    "UPDATE points SET h_angle_deg = ? WHERE doc_id = ?;",
+                    (f_val, doc_id),
+                )
+            elif col_upper in ("VANGLE", "V_ANGLE", "V_ANGLE_DEG"):
+                f_val = float(str(new_value).strip())
+                self.conn.execute(
+                    "UPDATE points SET v_angle_deg = ? WHERE doc_id = ?;",
+                    (f_val, doc_id),
+                )
+            else:
+                matched_key = column_name.strip()
+                for k in list(extra.keys()):
+                    if k.upper() == col_upper:
+                        matched_key = k
+                        break
+                extra[matched_key] = str(new_value).strip()
+                self.conn.execute(
+                    "UPDATE points SET extra_fields_json = ? WHERE doc_id = ?;",
+                    (json.dumps(extra), doc_id),
+                )
+
     def update_point_coords(self, doc_id: int, x: float, y: float, z: float) -> None:
         with self.conn:
             self.conn.execute(
@@ -729,3 +935,73 @@ class EDMDatabase:
             "prisms": str(prs_path),
             "units": str(unt_path),
         }
+
+    # --- Context-Dependent Defaults (EDM_Defaults / frmSubUnits Parity) ---
+    def save_context_defaults(
+        self,
+        master_var: str,
+        slave_vars: List[str],
+        rules: Dict[str, Dict[str, str]],
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO context_defaults (id, master_var, slave_vars_json, rules_json)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    master_var = excluded.master_var,
+                    slave_vars_json = excluded.slave_vars_json,
+                    rules_json = excluded.rules_json;
+                """,
+                (
+                    master_var.strip(),
+                    json.dumps(list(slave_vars)),
+                    json.dumps(rules),
+                ),
+            )
+
+    def load_context_defaults(self) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT master_var, slave_vars_json, rules_json FROM context_defaults WHERE id = 1;"
+        ).fetchone()
+        if not row:
+            return {"master_var": "", "slave_vars": [], "rules": {}}
+        return {
+            "master_var": row["master_var"] or "",
+            "slave_vars": json.loads(row["slave_vars_json"] or "[]"),
+            "rules": json.loads(row["rules_json"] or "{}"),
+        }
+
+    def clear_context_defaults(self) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM context_defaults WHERE id = 1;")
+
+    def update_context_default_rule(
+        self,
+        master_val: str,
+        current_form_values: Dict[str, Any],
+    ) -> None:
+        ctx = self.load_context_defaults()
+        master_var = ctx["master_var"]
+        slave_vars = ctx["slave_vars"]
+        if not master_var or not slave_vars:
+            return
+        m_key = str(master_val).strip().upper()
+        if not m_key:
+            return
+        rules = ctx["rules"]
+        entry = dict(rules.get(m_key, {}))
+        for sv in slave_vars:
+            for k, v in current_form_values.items():
+                if k.upper() == sv.upper():
+                    entry[sv] = str(v).strip()
+                    break
+        rules[m_key] = entry
+        self.save_context_defaults(master_var, slave_vars, rules)
+
+    def get_context_dependent_values(self, master_val: str) -> Dict[str, str]:
+        ctx = self.load_context_defaults()
+        m_key = str(master_val).strip().upper()
+        if not ctx["master_var"] or not m_key:
+            return {}
+        return dict(ctx["rules"].get(m_key, {}))

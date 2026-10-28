@@ -78,6 +78,10 @@ class EDMConfig:
     station_x: Optional[float] = None
     station_y: Optional[float] = None
     station_z: Optional[float] = None
+    use_ts_log: bool = False
+    ts_log_file: str = ""
+    use_general_log: bool = False
+    general_log_file: str = ""
     nikon_prism_offset_mm: float = 17.0
     unit_fields_Explicit: List[str] = field(default_factory=list)
     speed_buttons: List[str] = field(default_factory=list)
@@ -294,6 +298,15 @@ def parse_cfg_text(text: str) -> EDMConfig:
                     u.strip() for u in items["unitfields"].split(",") if u.strip()
                 ]
 
+            if "usetslog" in items:
+                cfg.use_ts_log = _parse_bool(items["usetslog"], False)
+            if "tslogfile" in items:
+                cfg.ts_log_file = items["tslogfile"]
+            if "usegenerallog" in items:
+                cfg.use_general_log = _parse_bool(items["usegenerallog"], False)
+            if "generallogfile" in items:
+                cfg.general_log_file = items["generallogfile"]
+
             if "nikonprismoffset" in items:
                 try:
                     cfg.nikon_prism_offset_mm = float(items["nikonprismoffset"])
@@ -420,6 +433,12 @@ def save_legacy_cfg_file(cfg: EDMConfig, path: str | Path) -> None:
         lines.append(f"stationY={cfg.station_y:.3f}")
     if cfg.station_z is not None:
         lines.append(f"stationZ={cfg.station_z:.3f}")
+    lines.append(f"UseTSLog={'TRUE' if cfg.use_ts_log else 'FALSE'}")
+    if cfg.ts_log_file:
+        lines.append(f"TSLogFile={cfg.ts_log_file}")
+    lines.append(f"UseGeneralLog={'TRUE' if cfg.use_general_log else 'FALSE'}")
+    if cfg.general_log_file:
+        lines.append(f"GeneralLogFile={cfg.general_log_file}")
     lines.append("")
 
     for macro in cfg.button_macros:
@@ -465,3 +484,118 @@ def load_cfg_file(path: str | Path) -> EDMConfig:
 def save_cfg_json(cfg: EDMConfig, path: str | Path) -> None:
     p = Path(path)
     p.write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
+
+
+def build_default_paleolithic_cfg(
+    cfg_filename: str,
+    db_filename: str,
+    points_table: str = "Points",
+    station_type: str = "Simulator",
+    com_port: str = "COM1",
+    baudrate: int = 1200,
+    parity: str = "E",
+    bytesize: int = 7,
+    stopbits: int = 1,
+) -> EDMConfig:
+    """
+    Replicates frmDefault (0x0043db0c / 0x00438440-0x004386e4):
+    Builds the standard Paleolithic excavation default .CFG schema with:
+    - UNIT (Menu: UNIT1,UNIT2)
+    - ID (Numeric, Increment=True, Carry=True)
+    - SUFFIX (Numeric, Default=0)
+    - Code (Menu: ARTIFACT,BONE,STONE,TOPO)
+    - Level (Menu: Level1,Level2, UnitField=True)
+    - Excavator (Menu: Utsav,Steve, UnitField=True)
+    - PRISM, VANGLE, HANGLE, SLOPED, DATUMNAME, DATUMX, DATUMY, DATUMZ, DATE, TIME
+    """
+    db_path_obj = Path(db_filename)
+    fields = [
+        FieldSpec(
+            name="UNIT",
+            field_type="MENU",
+            length=10,
+            prompt="Unit",
+            menu_items=["UNIT1", "UNIT2"],
+            carry=True,
+            required=True,
+            default="UNIT1",
+        ),
+        FieldSpec(
+            name="ID",
+            field_type="NUMERIC",
+            length=10,
+            prompt="ID",
+            carry=True,
+            increment=True,
+            unit_field=True,
+            required=True,
+            default="1",
+        ),
+        FieldSpec(
+            name="SUFFIX",
+            field_type="NUMERIC",
+            length=5,
+            prompt="Suffix",
+            carry=False,
+            required=True,
+            default="0",
+        ),
+        FieldSpec(
+            name="Code",
+            field_type="MENU",
+            length=15,
+            prompt="Code",
+            menu_items=["ARTIFACT", "BONE", "STONE", "TOPO"],
+            carry=True,
+            required=True,
+            default="ARTIFACT",
+        ),
+        FieldSpec(
+            name="Level",
+            field_type="MENU",
+            length=10,
+            prompt="Level",
+            menu_items=["Level1", "Level2"],
+            carry=True,
+            unit_field=True,
+            required=True,
+            default="Level1",
+        ),
+        FieldSpec(
+            name="Excavator",
+            field_type="MENU",
+            length=15,
+            prompt="Excavator",
+            menu_items=["Utsav", "Steve"],
+            carry=True,
+            unit_field=True,
+            required=False,
+            default="Utsav",
+        ),
+    ]
+    macros = [
+        SpeedButtonMacro(index=1, title="ARTIFACT", shortcut="1", field_values={"Code": "ARTIFACT"}),
+        SpeedButtonMacro(index=2, title="BONE", shortcut="2", field_values={"Code": "BONE"}),
+        SpeedButtonMacro(index=3, title="STONE", shortcut="3", field_values={"Code": "STONE"}),
+        SpeedButtonMacro(index=4, title="TOPO", shortcut="4", field_values={"Code": "TOPO"}),
+    ]
+    return EDMConfig(
+        station_type=station_type,
+        com_port=com_port if com_port.upper().startswith("COM") else f"COM{com_port}",
+        baudrate=int(baudrate),
+        parity=parity.strip().upper()[0] if parity.strip() else "N",
+        bytesize=int(bytesize),
+        stopbits=int(stopbits),
+        database_name=db_path_obj.name,
+        db_path=str(db_path_obj.parent) if str(db_path_obj.parent) != "." else "",
+        point_table=points_table.strip() or "Points",
+        station_name="Main",
+        station_x=100.000,
+        station_y=100.000,
+        station_z=10.000,
+        unit_fields_Explicit=["ID", "Level", "Excavator"],
+        speed_buttons=["ARTIFACT", "BONE", "STONE", "TOPO"],
+        button_macros=macros,
+        fields=fields,
+    )
+

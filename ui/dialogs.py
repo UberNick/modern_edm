@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import copy
 import math
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -30,6 +33,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -42,8 +46,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from drivers.total_station import SerialConfig, TotalStationDriver, create_driver
-from storage.cfg_parser import EDMConfig, FieldSpec, SpeedButtonMacro
+from drivers.total_station import (
+    RawObservation,
+    SerialConfig,
+    TotalStationDriver,
+    create_driver,
+    dms_encoded_to_radians,
+)
+from storage.cfg_parser import (
+    EDMConfig,
+    FieldSpec,
+    SpeedButtonMacro,
+    build_default_paleolithic_cfg,
+    save_legacy_cfg_file,
+)
 from storage.database import EDMDatabase
 from survey.math_engine import (
     Datum,
@@ -58,6 +74,7 @@ from survey.math_engine import (
     initialize_one_point,
     initialize_resection,
     initialize_two_point_backsight,
+    reduce_polar_to_cartesian,
     validate_prism_bounds,
     verify_station,
 )
@@ -1482,3 +1499,1513 @@ class EntityManagerDialog(QDialog):
         else:
             self.db.delete_unit(name)
         self._reload_table()
+
+
+class FieldFilterDialog(QDialog):
+    """
+    Replicates frmFilter (0x00439638 / FUN_00501b90 - 'Set Grid Filter'):
+    - Left list ('Fields' / lstVars): All core columns and defined .CFG fields
+    - Right list ('Values' / lstVals): Distinct recorded values for the selected field
+      ('select distinct [<field>] from [<PointTable>]' @ 0x00437f9c)
+    - Enforces 'Select field and value to filter by.' (0x00437f38) and alerts
+      'No values currently in this table' (0x00437fdc) if empty.
+    """
+
+    CORE_FILTER_FIELDS = ["UNIT", "ID", "SUFFIX", "PRISM"]
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        cfg: EDMConfig,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Set Grid Filter")
+        self.resize(520, 380)
+        self.db = db
+        self.cfg = cfg
+        self.selected_field: Optional[str] = None
+        self.selected_value: Optional[str] = None
+
+        root = QVBoxLayout(self)
+
+        lists_row = QHBoxLayout()
+
+        left_col = QVBoxLayout()
+        left_col.addWidget(QLabel("Fields"))
+        self.lst_vars = QListWidget()
+        self.lst_vars.currentTextChanged.connect(self._on_field_selected)
+        left_col.addWidget(self.lst_vars, 1)
+        lists_row.addLayout(left_col, 1)
+
+        right_col = QVBoxLayout()
+        right_col.addWidget(QLabel("Values"))
+        self.lst_vals = QListWidget()
+        self.lst_vals.itemDoubleClicked.connect(lambda _: self._on_set_filter())
+        right_col.addWidget(self.lst_vals, 1)
+        lists_row.addLayout(right_col, 1)
+
+        root.addLayout(lists_row, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_set = QPushButton("Set Filter")
+        self.btn_set.clicked.connect(self._on_set_filter)
+        self.btn_clear = QPushButton("Show All (Clear Filter)")
+        self.btn_clear.clicked.connect(self._on_clear_filter)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_set)
+        btn_row.addWidget(self.btn_clear)
+        btn_row.addWidget(self.btn_cancel)
+        root.addLayout(btn_row)
+
+        self._populate_fields()
+
+    def _populate_fields(self) -> None:
+        self.lst_vars.clear()
+        seen: List[str] = []
+        for f in self.cfg.fields:
+            if f.name not in seen:
+                seen.append(f.name)
+        for core_f in self.CORE_FILTER_FIELDS:
+            if all(s.upper() != core_f for s in seen):
+                seen.append(core_f)
+        self.lst_vars.addItems(seen)
+        if seen:
+            self.lst_vars.setCurrentRow(0)
+
+    def _on_field_selected(self, field_name: str) -> None:
+        self.lst_vals.clear()
+        clean = field_name.strip()
+        if not clean:
+            return
+        distinct_vals = self.db.get_distinct_field_values(clean)
+        for val in distinct_vals:
+            self.lst_vals.addItem(val)
+        if distinct_vals:
+            self.lst_vals.setCurrentRow(0)
+
+    def select_filter(self, field_name: str, field_value: str) -> None:
+        """
+        Programmatic helper matching frmFilter validation (0x00437f38):
+        Raises ValueError('Select field and value to filter by.') if either is empty.
+        """
+        f_clean = field_name.strip()
+        v_clean = field_value.strip()
+        if not f_clean or not v_clean:
+            raise ValueError("Select field and value to filter by.")
+        self.selected_field = f_clean
+        self.selected_value = v_clean
+
+    def _on_set_filter(self) -> None:
+        var_item = self.lst_vars.currentItem()
+        val_item = self.lst_vals.currentItem()
+        if self.lst_vals.count() == 0:
+            QMessageBox.information(
+                self, "Empty Field", "No values currently in this table"
+            )
+            return
+        f_name = var_item.text().strip() if var_item else ""
+        f_val = val_item.text().strip() if val_item else ""
+        try:
+            self.select_filter(f_name, f_val)
+            self.accept()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Filter Selection", str(exc))
+
+    def _on_clear_filter(self) -> None:
+        self.selected_field = None
+        self.selected_value = None
+        self.accept()
+
+
+class DataGridDialog(QDialog):
+    """
+    Replicates frmDataGrid (0x0043b8f4 / FUN_005039a0 - 'Data'):
+    - Left panel ('Display Fields' / lstFields): Checkable list of all core & custom .CFG columns
+      allowing the user to dynamically show/hide columns (ParseGridFields / FormatGrid).
+    - Right panel ('DataGrid' / MSDataGridLib.DataGrid): Full spreadsheet view of recorded points
+      supporting direct inline cell editing (automatically committed to SQLite via update_point_cell).
+    - Top/Bottom controls:
+      * 'Filter by ...' button (opens FieldFilterDialog / frmFilter)
+      * 'Clear Filter (Show All)' button
+      * 'Show only Points from Current Station' checkbox (replicates mnuFilter @ 0x0041103a)
+      * 'Delete Selected Row' button (with series resequencing)
+      * 'Hit ESCAPE to return to main form for editing' label (0x0043bc40)
+    """
+
+    BASE_COLUMNS = [
+        "RecNo",
+        "UNIT",
+        "ID",
+        "SUFFIX",
+        "X",
+        "Y",
+        "Z",
+        "PRISM",
+        "PRISM_HT",
+        "SLOPED",
+        "HANGLE",
+        "VANGLE",
+        "TIMESTAMP",
+    ]
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        cfg: EDMConfig,
+        filter_current_station_only: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Data (Show Data Grid)")
+        self.resize(1080, 620)
+        self.db = db
+        self.cfg = cfg
+        self.active_filter_field: Optional[str] = None
+        self.active_filter_value: Optional[str] = None
+        self.filter_current_station_only: bool = filter_current_station_only
+        self._suppress_cell_signal: bool = False
+
+        # Build complete ordered list of available columns
+        self.all_columns: List[str] = list(self.BASE_COLUMNS)
+        for f in self.cfg.fields:
+            if all(c.upper() != f.name.upper() for c in self.all_columns):
+                self.all_columns.append(f.name)
+        for p in self.db.list_points():
+            for k in p.get("extra_fields", {}).keys():
+                if all(c.upper() != k.upper() for c in self.all_columns):
+                    self.all_columns.append(k)
+
+        root = QVBoxLayout(self)
+
+        # Top toolbar: Filter status, Current Station filter checkbox, and instructions
+        top_bar = QHBoxLayout()
+        self.lbl_filter_status = QLabel("Filter: None (Showing all records)")
+        self.chk_station_filter = QCheckBox("Show only Points from Current Station")
+        self.chk_station_filter.setChecked(self.filter_current_station_only)
+        self.chk_station_filter.toggled.connect(self._on_station_filter_toggled)
+
+        top_bar.addWidget(self.lbl_filter_status, 1)
+        top_bar.addWidget(self.chk_station_filter)
+        root.addLayout(top_bar)
+
+        # Body split: Left = Display Fields checklist, Right = Editable DataGrid
+        body = QHBoxLayout()
+
+        left_box = QGroupBox("Display Fields")
+        left_layout = QVBoxLayout(left_box)
+        left_box.setMaximumWidth(230)
+        self.lst_fields = QListWidget()
+        for col_name in self.all_columns:
+            item = QListWidgetItem(col_name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.lst_fields.addItem(item)
+        self.lst_fields.itemChanged.connect(self._on_display_field_toggled)
+        left_layout.addWidget(self.lst_fields, 1)
+
+        btn_filter_by = QPushButton("Filter by ...")
+        btn_filter_by.clicked.connect(self._on_open_filter_dialog)
+        btn_clear_filter = QPushButton("Show All Records")
+        btn_clear_filter.clicked.connect(self.clear_filter)
+        left_layout.addWidget(btn_filter_by)
+        left_layout.addWidget(btn_clear_filter)
+        body.addWidget(left_box)
+
+        right_box = QGroupBox("Point Data Grid (Double-Click Any Cell to Edit Inline)")
+        right_layout = QVBoxLayout(right_box)
+        self.grid = QTableWidget()
+        self.grid.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.grid.horizontalHeader().setStretchLastSection(True)
+        self.grid.cellChanged.connect(self._on_cell_edited)
+        right_layout.addWidget(self.grid, 1)
+        body.addWidget(right_box, 1)
+
+        root.addLayout(body, 1)
+
+        # Footer: Escape hint + Delete Row + Close
+        footer = QHBoxLayout()
+        lbl_esc = QLabel("Hit ESCAPE to return to main form for editing")
+        btn_delete_row = QPushButton("Delete Selected Row")
+        btn_delete_row.clicked.connect(self._on_delete_selected_row)
+        btn_close = QPushButton("Close [ESC]")
+        btn_close.clicked.connect(self.accept)
+        footer.addWidget(lbl_esc, 1)
+        footer.addWidget(btn_delete_row)
+        footer.addWidget(btn_close)
+        root.addLayout(footer)
+
+        self.reload_grid()
+
+    def _on_station_filter_toggled(self, checked: bool) -> None:
+        self.filter_current_station_only = checked
+        self.reload_grid()
+
+    def apply_filter(self, field_name: Optional[str], field_value: Optional[str]) -> None:
+        """Applies a field=value filter and reloads the DataGrid."""
+        self.active_filter_field = field_name
+        self.active_filter_value = field_value
+        self.reload_grid()
+
+    def clear_filter(self) -> None:
+        """Clears any active field=value filter and reloads all records."""
+        self.active_filter_field = None
+        self.active_filter_value = None
+        self.reload_grid()
+
+    def _on_open_filter_dialog(self) -> None:
+        dlg = FieldFilterDialog(self.db, self.cfg, self)
+        if dlg.exec() == FieldFilterDialog.Accepted:
+            self.apply_filter(dlg.selected_field, dlg.selected_value)
+
+    def set_column_checked(self, col_name: str, checked: bool) -> None:
+        """Programmatically checks or unchecks a column in Display Fields (lstFields)."""
+        for i in range(self.lst_fields.count()):
+            item = self.lst_fields.item(i)
+            if item and item.text().upper() == col_name.strip().upper():
+                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                break
+        self._apply_column_visibility()
+
+    def _on_display_field_toggled(self, _item: QListWidgetItem) -> None:
+        self._apply_column_visibility()
+
+    def _apply_column_visibility(self) -> None:
+        for idx in range(self.lst_fields.count()):
+            item = self.lst_fields.item(idx)
+            if item is not None and idx < self.grid.columnCount():
+                is_visible = item.checkState() == Qt.Checked
+                self.grid.setColumnHidden(idx, not is_visible)
+
+    def _extract_cell_text(self, pt: Dict[str, Any], col_name: str) -> str:
+        c_up = col_name.upper()
+        if c_up == "RECNO":
+            return str(pt["doc_id"])
+        if c_up == "UNIT":
+            return str(pt.get("unit", ""))
+        if c_up == "ID":
+            return str(pt.get("id", ""))
+        if c_up == "SUFFIX":
+            return str(pt.get("suffix", 0))
+        if c_up == "X":
+            return f"{float(pt.get('x', 0.0)):.4f}"
+        if c_up == "Y":
+            return f"{float(pt.get('y', 0.0)):.4f}"
+        if c_up == "Z":
+            return f"{float(pt.get('z', 0.0)):.4f}"
+        if c_up == "PRISM":
+            return str(pt.get("prism_name", ""))
+        if c_up == "PRISM_HT":
+            return f"{float(pt.get('prism_height', 0.0)):.3f}"
+        if c_up == "SLOPED":
+            return f"{float(pt.get('slope_dist', 0.0)):.4f}"
+        if c_up == "HANGLE":
+            return f"{float(pt.get('h_angle_deg', 0.0)):.4f}"
+        if c_up == "VANGLE":
+            return f"{float(pt.get('v_angle_deg', 0.0)):.4f}"
+        if c_up == "TIMESTAMP":
+            return str(pt.get("timestamp", ""))
+
+        extra = pt.get("extra_fields", {})
+        for k, v in extra.items():
+            if k.upper() == c_up:
+                return str(v)
+        return ""
+
+    def reload_grid(self) -> None:
+        stn_xyz: Optional[Tuple[float, float, float]] = None
+        if self.filter_current_station_only:
+            stn = self.db.load_station_state()
+            stn_xyz = (stn.x, stn.y, stn.instrument_center_z)
+
+        pts = self.db.filter_points(
+            field_name=self.active_filter_field,
+            field_value=self.active_filter_value,
+            station_xyz=stn_xyz,
+        )
+
+        filter_parts: List[str] = []
+        if self.active_filter_field and self.active_filter_value is not None:
+            filter_parts.append(f"{self.active_filter_field} = '{self.active_filter_value}'")
+        if self.filter_current_station_only:
+            filter_parts.append("Current Station Only")
+        filter_desc = " AND ".join(filter_parts) if filter_parts else "None (All Records)"
+        self.lbl_filter_status.setText(f"Filter: {filter_desc} | Showing {len(pts)} record(s)")
+
+        self._suppress_cell_signal = True
+        try:
+            self.grid.clear()
+            self.grid.setColumnCount(len(self.all_columns))
+            self.grid.setHorizontalHeaderLabels(self.all_columns)
+            self.grid.setRowCount(len(pts))
+
+            for r, p in enumerate(pts):
+                doc_id = int(p["doc_id"])
+                for c, col_name in enumerate(self.all_columns):
+                    val_str = self._extract_cell_text(p, col_name)
+                    cell = QTableWidgetItem(val_str)
+                    cell.setData(Qt.UserRole, doc_id)
+                    # RecNo and TIMESTAMP are read-only primary/audit keys
+                    if col_name.upper() in ("RECNO", "TIMESTAMP"):
+                        cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
+                    self.grid.setItem(r, c, cell)
+
+            self._apply_column_visibility()
+        finally:
+            self._suppress_cell_signal = False
+
+    def edit_cell_programmatically(self, row: int, col_name: str, new_text: str) -> None:
+        """Programmatic helper for testing inline cell editing."""
+        col_idx = next(
+            (i for i, name in enumerate(self.all_columns) if name.upper() == col_name.strip().upper()),
+            -1,
+        )
+        if col_idx < 0 or not (0 <= row < self.grid.rowCount()):
+            raise ValueError(f"Invalid grid cell ({row}, {col_name!r})")
+        item = self.grid.item(row, col_idx)
+        if item is None:
+            raise ValueError("Grid item not initialized")
+        item.setText(str(new_text))
+
+    def _on_cell_edited(self, row: int, col: int) -> None:
+        if self._suppress_cell_signal:
+            return
+        item = self.grid.item(row, col)
+        if item is None or not (0 <= col < len(self.all_columns)):
+            return
+        doc_id = item.data(Qt.UserRole)
+        if doc_id is None:
+            return
+        col_name = self.all_columns[col]
+        new_val = item.text().strip()
+
+        try:
+            # Validate numeric columns before committing
+            for f in self.cfg.fields:
+                if f.name.upper() == col_name.upper() and f.field_type.upper() in ("NUMERIC", "INTEGER"):
+                    float(new_val)
+            if col_name.upper() in ("X", "Y", "Z", "SUFFIX", "PRISM_HT", "SLOPED", "HANGLE", "VANGLE"):
+                float(new_val)
+
+            self.db.update_point_cell(int(doc_id), col_name, new_val)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self,
+                "Invalid Cell Value",
+                f"This field requires valid input ({exc}). Reverting edit.",
+            )
+            self.reload_grid()
+
+    def _on_delete_selected_row(self) -> None:
+        row = self.grid.currentRow()
+        if row < 0:
+            return
+        rec_item = self.grid.item(row, 0)
+        if rec_item is None:
+            return
+        doc_id = int(rec_item.data(Qt.UserRole))
+        ans = QMessageBox.question(
+            self,
+            "Delete Record",
+            f"Warning: Deleting will permanently remove Record #{doc_id}. Continue anyway?",
+        )
+        if ans == QMessageBox.Yes:
+            self.db.delete_point_with_resequencing(doc_id, delete_entire_series=False)
+            self.reload_grid()
+
+
+class ContextDefaultsDialog(QDialog):
+    """Replicates frmSubUnits (0x0043a5e0 / FUN_0052def0 - 'Context-Dependent Defaults')."""
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        cfg: EDMConfig,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Context-Dependent Defaults")
+        self.resize(680, 480)
+        self.db = db
+        self.cfg = cfg
+
+        ctx = self.db.load_context_defaults()
+        self.master_var: str = ctx["master_var"]
+        self.slave_vars: List[str] = list(ctx["slave_vars"])
+        self.rules: Dict[str, Dict[str, str]] = copy.deepcopy(ctx["rules"])
+        self._suppress_signals: bool = False
+
+        root = QVBoxLayout(self)
+        desc = QLabel(
+            "Setting Context Dependent Defaults allows you to associate specific values "
+            "for the Dependent variables with different values of the Master Variable."
+        )
+        desc.setWordWrap(True)
+        root.addWidget(desc)
+
+        top_split = QHBoxLayout()
+
+        left_box = QGroupBox("Master Variable")
+        left_layout = QVBoxLayout(left_box)
+        self.cmb_master = QComboBox()
+        field_names = [
+            f.name for f in self.cfg.fields if f.name.upper() not in ("ID", "SUFFIX")
+        ]
+        self.cmb_master.addItems(field_names)
+        if self.master_var and self.master_var in field_names:
+            self.cmb_master.setCurrentText(self.master_var)
+        elif field_names:
+            self.master_var = field_names[0]
+        self.cmb_master.currentTextChanged.connect(self._on_master_changed)
+        left_layout.addWidget(QLabel("Master Variable:"))
+        left_layout.addWidget(self.cmb_master)
+
+        left_layout.addWidget(QLabel("Master Value (e.g. Level '2A' or Unit 'N100E100'):"))
+        self.cmb_master_val = QComboBox()
+        self.cmb_master_val.setEditable(True)
+        self.cmb_master_val.currentTextChanged.connect(self._reload_rule_table)
+        left_layout.addWidget(self.cmb_master_val)
+        left_layout.addStretch()
+        top_split.addWidget(left_box, 1)
+
+        right_box = QGroupBox("Dependent Variables")
+        right_layout = QVBoxLayout(right_box)
+        self.lst_slaves = QListWidget()
+        self.lst_slaves.itemChanged.connect(self._on_slave_toggled)
+        right_layout.addWidget(self.lst_slaves, 1)
+        top_split.addWidget(right_box, 1)
+
+        root.addLayout(top_split, 1)
+
+        rule_box = QGroupBox("Associated Default Values for Selected Master Value")
+        rule_layout = QVBoxLayout(rule_box)
+        self.tbl_rules = QTableWidget()
+        self.tbl_rules.setColumnCount(2)
+        self.tbl_rules.setHorizontalHeaderLabels(["Dependent Variable", "Default Value"])
+        self.tbl_rules.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_rules.cellChanged.connect(self._on_rule_cell_edited)
+        rule_layout.addWidget(self.tbl_rules, 1)
+        root.addWidget(rule_box, 1)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK (Save)")
+        ok_btn.clicked.connect(self._on_save)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self._on_clear)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(clear_btn)
+        btn_row.addWidget(cancel_btn)
+        root.addLayout(btn_row)
+
+        self._populate_slave_list()
+        self._populate_master_values()
+        self._reload_rule_table()
+
+    def _populate_slave_list(self) -> None:
+        self._suppress_signals = True
+        try:
+            self.lst_slaves.clear()
+            for f in self.cfg.fields:
+                if f.name.upper() in ("ID", "SUFFIX", self.master_var.upper()):
+                    continue
+                item = QListWidgetItem(f.name)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                is_checked = any(s.upper() == f.name.upper() for s in self.slave_vars)
+                item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
+                self.lst_slaves.addItem(item)
+        finally:
+            self._suppress_signals = False
+
+    def _populate_master_values(self) -> None:
+        self._suppress_signals = True
+        try:
+            self.cmb_master_val.clear()
+            vals: List[str] = []
+            for f in self.cfg.fields:
+                if f.name.upper() == self.master_var.upper():
+                    vals.extend(f.menu_items)
+                    break
+            for dv in self.db.get_distinct_field_values(self.master_var):
+                if dv not in vals:
+                    vals.append(dv)
+            for rk in self.rules.keys():
+                if rk not in vals:
+                    vals.append(rk)
+            if not vals:
+                vals = ["DEFAULT"]
+            self.cmb_master_val.addItems(vals)
+        finally:
+            self._suppress_signals = False
+
+    def _on_master_changed(self, new_master: str) -> None:
+        if self._suppress_signals:
+            return
+        self.master_var = new_master.strip()
+        self.slave_vars = [
+            s for s in self.slave_vars if s.upper() != self.master_var.upper()
+        ]
+        self._populate_slave_list()
+        self._populate_master_values()
+        self._reload_rule_table()
+
+    def _on_slave_toggled(self, _item: QListWidgetItem) -> None:
+        if self._suppress_signals:
+            return
+        checked: List[str] = []
+        for i in range(self.lst_slaves.count()):
+            it = self.lst_slaves.item(i)
+            if it and it.checkState() == Qt.Checked:
+                checked.append(it.text())
+        self.slave_vars = checked
+        self._reload_rule_table()
+
+    def set_slave_checked(self, field_name: str, checked: bool) -> None:
+        for i in range(self.lst_slaves.count()):
+            it = self.lst_slaves.item(i)
+            if it and it.text().upper() == field_name.strip().upper():
+                it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                break
+
+    def set_rule_value(self, master_val: str, slave_var: str, default_val: str) -> None:
+        m_key = master_val.strip().upper()
+        if not m_key:
+            return
+        if all(s.upper() != slave_var.strip().upper() for s in self.slave_vars):
+            self.slave_vars.append(slave_var.strip())
+            self._populate_slave_list()
+        entry = dict(self.rules.get(m_key, {}))
+        entry[slave_var.strip()] = default_val.strip()
+        self.rules[m_key] = entry
+        self._reload_rule_table()
+
+    def _reload_rule_table(self) -> None:
+        self._suppress_signals = True
+        try:
+            m_key = self.cmb_master_val.currentText().strip().upper()
+            entry = self.rules.get(m_key, {})
+            self.tbl_rules.setRowCount(len(self.slave_vars))
+            for r, sv in enumerate(self.slave_vars):
+                name_item = QTableWidgetItem(sv)
+                name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+                val_item = QTableWidgetItem(entry.get(sv, ""))
+                self.tbl_rules.setItem(r, 0, name_item)
+                self.tbl_rules.setItem(r, 1, val_item)
+        finally:
+            self._suppress_signals = False
+
+    def _on_rule_cell_edited(self, row: int, col: int) -> None:
+        if self._suppress_signals or col != 1:
+            return
+        m_key = self.cmb_master_val.currentText().strip().upper()
+        if not m_key or not (0 <= row < len(self.slave_vars)):
+            return
+        sv = self.slave_vars[row]
+        val_item = self.tbl_rules.item(row, 1)
+        new_val = val_item.text().strip() if val_item else ""
+        entry = dict(self.rules.get(m_key, {}))
+        entry[sv] = new_val
+        self.rules[m_key] = entry
+
+    def _on_clear(self) -> None:
+        ans = QMessageBox.question(
+            self,
+            "Clear Context Defaults",
+            "This will clear default values stored in the database. Proceed anyway?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans == QMessageBox.Yes:
+            self.db.clear_context_defaults()
+            self.master_var = ""
+            self.slave_vars.clear()
+            self.rules.clear()
+            self.accept()
+
+    def _on_save(self) -> None:
+        if not self.slave_vars:
+            ans = QMessageBox.question(
+                self,
+                "No Dependent Variables",
+                "No dependent variables have been checked. Do you want to clear this function?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ans == QMessageBox.Yes:
+                self.db.clear_context_defaults()
+                self.accept()
+            return
+        self.db.save_context_defaults(self.master_var, self.slave_vars, self.rules)
+        self.accept()
+
+
+class ManualShotDialog(QDialog):
+    """Replicates frmManualshot (0x0043b17c / FUN_004e8730 - 'Record point')."""
+
+    def __init__(
+        self,
+        default_prism_height: float = 0.0,
+        default_mode: str = "ANGLES",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Record point (Manual Entry)")
+        self.resize(440, 320)
+        self.observation: Optional[RawObservation] = None
+        self.prism_height: float = default_prism_height
+
+        root = QVBoxLayout(self)
+
+        mode_box = QGroupBox("Manual Input Mode")
+        mode_row = QHBoxLayout(mode_box)
+        self.mode_group = QButtonGroup(self)
+        self.rb_angles = QRadioButton("Vertical angle, Horizontal Angle and Distance")
+        self.rb_xyz = QRadioButton("X, Y and Z coordinates")
+        self.mode_group.addButton(self.rb_angles)
+        self.mode_group.addButton(self.rb_xyz)
+        mode_row.addWidget(self.rb_angles)
+        mode_row.addWidget(self.rb_xyz)
+        root.addWidget(mode_box)
+
+        self.form_widget = QWidget()
+        self.form_layout = QFormLayout(self.form_widget)
+
+        self.txt_hangle = QLineEdit()
+        self.txt_hangle.setPlaceholderText("ddd.mmss (e.g. 90.0000)")
+        self.txt_vangle = QLineEdit()
+        self.txt_vangle.setPlaceholderText("ddd.mmss (e.g. 90.0000)")
+        self.txt_sloped = QLineEdit()
+        self.txt_sloped.setPlaceholderText("meters (e.g. 10.000)")
+        self.txt_poleh = QLineEdit(f"{default_prism_height:.3f}")
+        self.txt_poleh.setPlaceholderText("meters [-10 to 10]")
+
+        self.txt_x = QLineEdit()
+        self.txt_x.setPlaceholderText("meters")
+        self.txt_y = QLineEdit()
+        self.txt_y.setPlaceholderText("meters")
+        self.txt_z = QLineEdit()
+        self.txt_z.setPlaceholderText("meters")
+
+        self.lbl_h = QLabel("Horizontal angle (ddd.mmss):")
+        self.lbl_v = QLabel("Vertical angle (ddd.mmss):")
+        self.lbl_sd = QLabel("Slope distance (meters):")
+        self.lbl_ph = QLabel("Prism height (meters):")
+
+        self.lbl_x = QLabel("X coordinate (meters):")
+        self.lbl_y = QLabel("Y coordinate (meters):")
+        self.lbl_z = QLabel("Z coordinate (meters):")
+
+        self.form_layout.addRow(self.lbl_h, self.txt_hangle)
+        self.form_layout.addRow(self.lbl_v, self.txt_vangle)
+        self.form_layout.addRow(self.lbl_sd, self.txt_sloped)
+        self.form_layout.addRow(self.lbl_ph, self.txt_poleh)
+        self.form_layout.addRow(self.lbl_x, self.txt_x)
+        self.form_layout.addRow(self.lbl_y, self.txt_y)
+        self.form_layout.addRow(self.lbl_z, self.txt_z)
+        root.addWidget(self.form_widget, 1)
+
+        self.rb_angles.toggled.connect(self._update_mode_visibility)
+        if default_mode.strip().upper() == "XYZ":
+            self.rb_xyz.setChecked(True)
+        else:
+            self.rb_angles.setChecked(True)
+        self._update_mode_visibility()
+
+        btn_row = QHBoxLayout()
+        accept_btn = QPushButton("&Accept")
+        accept_btn.clicked.connect(self._on_accept)
+        cancel_btn = QPushButton("&Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(accept_btn)
+        btn_row.addWidget(cancel_btn)
+        root.addLayout(btn_row)
+
+    def _update_mode_visibility(self) -> None:
+        is_angles = self.rb_angles.isChecked()
+        for w in (
+            self.lbl_h, self.txt_hangle,
+            self.lbl_v, self.txt_vangle,
+            self.lbl_sd, self.txt_sloped,
+            self.lbl_ph, self.txt_poleh,
+        ):
+            w.setVisible(is_angles)
+        for w in (
+            self.lbl_x, self.txt_x,
+            self.lbl_y, self.txt_y,
+            self.lbl_z, self.txt_z,
+        ):
+            w.setVisible(not is_angles)
+
+    def submit_angles(
+        self,
+        h_angle_dddmmss: str | float,
+        v_angle_dddmmss: str | float,
+        slope_dist: str | float,
+        prism_height: str | float = 0.0,
+    ) -> RawObservation:
+        try:
+            h_str = str(h_angle_dddmmss).strip()
+            v_str = str(v_angle_dddmmss).strip()
+            sd_str = str(slope_dist).strip()
+            ph_str = str(prism_height).strip() or "0.0"
+            if not h_str or not v_str or not sd_str:
+                raise ValueError("Enter a vertical angle, horizontal angle, and slope distance.")
+            h_val = float(h_str)
+            v_val = float(v_str)
+            sd_val = float(sd_str)
+            ph_val = float(ph_str)
+        except ValueError as exc:
+            raise ValueError("Enter a vertical angle, horizontal angle, and slope distance.") from exc
+
+        validate_prism_bounds(ph_val, 0.0)
+        if sd_val <= 0.0 or not (0.0 <= h_val <= 360.0) or not (0.0 <= v_val <= 360.0):
+            raise ValueError("Enter a vertical angle, horizontal angle, and slope distance.")
+
+        hz_rad = dms_encoded_to_radians(h_val) % (2.0 * math.pi)
+        v_rad = dms_encoded_to_radians(v_val)
+        self.prism_height = ph_val
+        self.observation = RawObservation(
+            slope_distance=sd_val,
+            horizontal_angle_rad=hz_rad,
+            vertical_angle_rad=v_rad,
+            raw_tx="MANUAL_ANGLES",
+            raw_rx=f"H={h_val:.4f} V={v_val:.4f} SD={sd_val:.3f} PH={ph_val:.3f}",
+        )
+        return self.observation
+
+    def submit_xyz(
+        self,
+        x_val: str | float,
+        y_val: str | float,
+        z_val: str | float,
+    ) -> RawObservation:
+        try:
+            xs = str(x_val).strip()
+            ys = str(y_val).strip()
+            zs = str(z_val).strip()
+            if not xs or not ys or not zs:
+                raise ValueError("Enter coordinates as numeric values.")
+            xf, yf, zf = float(xs), float(ys), float(zs)
+        except ValueError as exc:
+            raise ValueError("Enter coordinates as numeric values.") from exc
+
+        self.observation = RawObservation(
+            slope_distance=0.0,
+            horizontal_angle_rad=0.0,
+            vertical_angle_rad=math.pi / 2.0,
+            direct_xyz=(xf, yf, zf),
+            raw_tx="MANUAL_XYZ",
+            raw_rx=f"X={xf:.3f} Y={yf:.3f} Z={zf:.3f}",
+        )
+        return self.observation
+
+    def _on_accept(self) -> None:
+        try:
+            if self.rb_angles.isChecked():
+                self.submit_angles(
+                    self.txt_hangle.text(),
+                    self.txt_vangle.text(),
+                    self.txt_sloped.text(),
+                    self.txt_poleh.text(),
+                )
+            else:
+                self.submit_xyz(
+                    self.txt_x.text(),
+                    self.txt_y.text(),
+                    self.txt_z.text(),
+                )
+            self.accept()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Manual Entry Error", str(exc))
+
+
+class EDMStatusDialog(QDialog):
+    """
+    Replicates frmStatus (0x0043c6f0 / FUN_0050a820 - 'EDM Status'):
+    Displays read-only diagnostic fields for:
+    - CFG Filename (txtcfgfile)
+    - EDM INI Filename (txtinifile)
+    - Database (txtdbname)
+    - Total Station (txttotalstation)
+    - COMPort (txtcomport)
+    - Settings (txtsettings)
+    - Points Table (txtPointsTable)
+    - Station Name (txtstationname)
+    - Station Height (txtstationheight) + '(Not necessarily accurate depending on setup type)'
+    - Station X, Station Y, Station Z (txtstationx, txtstationy, txtstationz) +
+      'All points are relative to this location which is a point at the center of the total station and not the point on the ground.'
+    """
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        cfg: EDMConfig,
+        cfg_path: str = "",
+        ini_path: str = "edm.ini",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("EDM Status")
+        self.resize(560, 480)
+        self.db = db
+        self.cfg = cfg
+
+        stn = self.db.load_station_state()
+        pts_count = len(self.db.list_points())
+        settings_str = f"{cfg.baudrate},{cfg.parity},{cfg.bytesize},{cfg.stopbits}"
+
+        root = QVBoxLayout(self)
+
+        sys_group = QGroupBox("Configuration & Communication Status")
+        sys_form = QFormLayout(sys_group)
+
+        self.txt_cfg_file = self._ro_line(str(cfg_path or cfg.database_name or "sample_excavation.cfg"))
+        self.txt_ini_file = self._ro_line(str(ini_path))
+        self.txt_db_name = self._ro_line(str(db.db_path))
+        self.txt_total_station = self._ro_line(cfg.station_type)
+        self.txt_com_port = self._ro_line(cfg.com_port)
+        self.txt_settings = self._ro_line(settings_str)
+        self.txt_points_table = self._ro_line(f"{cfg.point_table} ({pts_count} records)")
+
+        sys_form.addRow("CFG Filename :", self.txt_cfg_file)
+        sys_form.addRow("EDM INI Filename :", self.txt_ini_file)
+        sys_form.addRow("Database :", self.txt_db_name)
+        sys_form.addRow("Total Station :", self.txt_total_station)
+        sys_form.addRow("COMPort :", self.txt_com_port)
+        sys_form.addRow("Settings :", self.txt_settings)
+        sys_form.addRow("Points Table :", self.txt_points_table)
+        root.addWidget(sys_group)
+
+        stn_group = QGroupBox("Current Station Coordinates (Optical Center)")
+        stn_layout = QVBoxLayout(stn_group)
+        note_lbl = QLabel(
+            "All points are relative to this location which is a point at the center "
+            "of the total station and not the point on the ground."
+        )
+        note_lbl.setWordWrap(True)
+        stn_layout.addWidget(note_lbl)
+
+        stn_form = QFormLayout()
+        self.txt_station_name = self._ro_line(f"{stn.station_name} [{stn.setup_method}]")
+        self.txt_station_x = self._ro_line(f"{stn.x:.3f}")
+        self.txt_station_y = self._ro_line(f"{stn.y:.3f}")
+        self.txt_station_z = self._ro_line(f"{stn.instrument_center_z:.3f}")
+        self.txt_station_height = self._ro_line(
+            f"{stn.instrument_height:.3f} (Not necessarily accurate depending on setup type)"
+        )
+
+        stn_form.addRow("Station Name :", self.txt_station_name)
+        stn_form.addRow("Station X :", self.txt_station_x)
+        stn_form.addRow("Station Y :", self.txt_station_y)
+        stn_form.addRow("Station Z :", self.txt_station_z)
+        stn_form.addRow("Station Height :", self.txt_station_height)
+        stn_layout.addLayout(stn_form)
+        root.addWidget(stn_group)
+
+        close_btn = QPushButton("OK")
+        close_btn.clicked.connect(self.accept)
+        root.addWidget(close_btn)
+
+    @staticmethod
+    def _ro_line(text: str) -> QLineEdit:
+        le = QLineEdit(text)
+        le.setReadOnly(True)
+        return le
+
+
+class DebugStationDialog(QDialog):
+    """
+    Replicates frmDebug (0x0043c19c / FUN_004c8840 / FUN_004cc370 - 'Debug Total Station'):
+    - COM Settings display (txtComSettings)
+    - Initialize button (btnInitialize)
+    - X-Shot button (btnXShot) that triggers a test shot and populates Results:
+      H-Angle (txtHangle), V-Angle (txtVangle), Slope-D (txtSloped), Pole H. (txtPoleHeight),
+      and reduced X, Y, Z coordinates (txtX, txtY, txtZ).
+    - Preset total station command dropdown (ts_commands) + Send (execute_command):
+      * '0 Horizontal Angle'
+      * 'Get date/time'
+      * 'Get Instr. Name'
+      * 'Launch measurement'
+      * 'Get meas. with tilt'
+    - Output log (txtOutput) + Clear (cmdClear) + Copy to Clipboard (Command1)
+    """
+
+    PRESET_COMMANDS = [
+        "0 Horizontal Angle",
+        "Get date/time",
+        "Get Instr. Name",
+        "Launch measurement",
+        "Get meas. with tilt",
+    ]
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        cfg: EDMConfig,
+        driver: TotalStationDriver,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Debug Total Station")
+        self.resize(700, 540)
+        self.db = db
+        self.cfg = cfg
+        self.driver = driver
+        self._is_initialized: bool = True
+
+        root = QVBoxLayout(self)
+        info_lbl = QLabel(
+            "This form is not a complete debug routine. Rather it contains code that helps "
+            "Shannon track down problems with new and different total stations. Be sure to "
+            "first set the COM port and the COM settings on the Select Total Station window."
+        )
+        info_lbl.setWordWrap(True)
+        root.addWidget(info_lbl)
+
+        # Top row: COM Settings + Initialize + X-Shot
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("COM Settings:"))
+        settings_str = f"{cfg.station_type} @ {cfg.com_port} ({cfg.baudrate},{cfg.parity},{cfg.bytesize},{cfg.stopbits})"
+        self.txt_com_settings = QLineEdit(settings_str)
+        self.txt_com_settings.setReadOnly(True)
+        btn_init = QPushButton("Initialize")
+        btn_init.clicked.connect(self.run_initialize)
+        btn_xshot = QPushButton("X-Shot")
+        btn_xshot.clicked.connect(self.run_xshot)
+        top_row.addWidget(self.txt_com_settings, 1)
+        top_row.addWidget(btn_init)
+        top_row.addWidget(btn_xshot)
+        root.addLayout(top_row)
+
+        # Second row: Preset command dropdown + Send button
+        cmd_row = QHBoxLayout()
+        cmd_row.addWidget(QLabel("Preset Command:"))
+        self.cbo_commands = QComboBox()
+        self.cbo_commands.setEditable(True)
+        self.cbo_commands.addItems(self.PRESET_COMMANDS)
+        btn_send = QPushButton("Send")
+        btn_send.clicked.connect(self._on_send_clicked)
+        cmd_row.addWidget(self.cbo_commands, 1)
+        cmd_row.addWidget(btn_send)
+        root.addLayout(cmd_row)
+
+        # Middle split: Output log on left, Results frame on right
+        mid_split = QHBoxLayout()
+
+        log_box = QGroupBox("Serial Output Log")
+        log_layout = QVBoxLayout(log_box)
+        self.txt_output = QPlainTextEdit()
+        self.txt_output.setReadOnly(True)
+        log_layout.addWidget(self.txt_output, 1)
+
+        log_btns = QHBoxLayout()
+        btn_clear = QPushButton("Clear")
+        btn_clear.clicked.connect(self.txt_output.clear)
+        btn_copy = QPushButton("Copy to Clipboard")
+        btn_copy.clicked.connect(self._on_copy_clipboard)
+        log_btns.addWidget(btn_clear)
+        log_btns.addWidget(btn_copy)
+        log_layout.addLayout(log_btns)
+        mid_split.addWidget(log_box, 3)
+
+        res_box = QGroupBox("Results")
+        res_form = QFormLayout(res_box)
+        self.txt_hangle = QLineEdit()
+        self.txt_vangle = QLineEdit()
+        self.txt_sloped = QLineEdit()
+        self.txt_pole_height = QLineEdit("0.000")
+        self.txt_x = QLineEdit()
+        self.txt_y = QLineEdit()
+        self.txt_z = QLineEdit()
+        for le in (self.txt_hangle, self.txt_vangle, self.txt_sloped, self.txt_x, self.txt_y, self.txt_z):
+            le.setReadOnly(True)
+
+        res_form.addRow("H-Angle:", self.txt_hangle)
+        res_form.addRow("V-Angle:", self.txt_vangle)
+        res_form.addRow("Slope-D:", self.txt_sloped)
+        res_form.addRow("Pole H.:", self.txt_pole_height)
+        res_form.addRow("X:", self.txt_x)
+        res_form.addRow("Y:", self.txt_y)
+        res_form.addRow("Z:", self.txt_z)
+        mid_split.addWidget(res_box, 2)
+
+        root.addLayout(mid_split, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        root.addWidget(close_btn)
+
+    def run_initialize(self) -> str:
+        """Replicates btnInitialize on frmDebug."""
+        res = self.driver.initialize_station_comm()
+        self._is_initialized = True
+        self.txt_output.appendPlainText(f"[Initialize] -> {res}")
+        return res
+
+    def run_xshot(self) -> RawObservation:
+        """Replicates btnXShot on frmDebug: measures a shot and populates H-Angle, V-Angle, Slope-D, X, Y, Z."""
+        stn = self.db.load_station_state()
+        try:
+            pole_h = float(self.txt_pole_height.text().strip() or "0.0")
+        except ValueError:
+            pole_h = 0.0
+
+        obs = self.driver.measure()
+        pt, _, _ = reduce_polar_to_cartesian(
+            station=stn,
+            slope_distance=obs.slope_distance,
+            horizontal_angle_rad=obs.horizontal_angle_rad,
+            vertical_angle_rad=obs.vertical_angle_rad,
+            prism_height=pole_h,
+            prism_offset=0.0,
+        )
+        self.txt_hangle.setText(f"{obs.horizontal_angle_dddmmss:.4f}")
+        self.txt_vangle.setText(f"{obs.vertical_angle_dddmmss:.4f}")
+        self.txt_sloped.setText(f"{obs.slope_distance:.3f}")
+        self.txt_x.setText(f"{pt.x:.3f}")
+        self.txt_y.setText(f"{pt.y:.3f}")
+        self.txt_z.setText(f"{pt.z:.3f}")
+        self.txt_output.appendPlainText(
+            f"[X-Shot] TX={obs.raw_tx!r} | RX={obs.raw_rx!r} -> "
+            f"X={pt.x:.3f} Y={pt.y:.3f} Z={pt.z:.3f}"
+        )
+        return obs
+
+    def execute_preset_command(self, command_label: str) -> str:
+        """
+        Replicates execute_command on frmDebug (FUN_004cc370 / FUN_004cc480 / FUN_004cc5a0 / FUN_004cc6b0):
+        Validates command_label against the 5 GeoCOM/EDMWin debug presets or raises
+        ValueError('Error: Unrecognize command selected.') / ValueError('Select a command from the dropdown next to this button.').
+        """
+        cmd_clean = command_label.strip()
+        if not cmd_clean:
+            raise ValueError("Select a command from the dropdown next to this button.")
+
+        wire_map = {
+            "0 HORIZONTAL ANGLE": self.driver.format_set_horizontal_angle_cmd(0.0) or "%R1Q,2113:0.0000000\r\n",
+            "GET DATE/TIME": "%R1Q,5008:\r\n",
+            "GET INSTR. NAME": "%R1Q,5004,6,21341:\r\n",
+            "LAUNCH MEASUREMENT": "%R1Q,2008:1,1\r\n",
+            "GET MEAS. WITH TILT": "%R1Q,2187:10000,1\r\n",
+        }
+        key = cmd_clean.upper()
+        if key not in wire_map:
+            raise ValueError("Error: Unrecognize command selected.")
+
+        wire_cmd = wire_map[key]
+        if hasattr(self.driver, "is_connected") and self.driver.is_connected and self.driver._serial is None:
+            # Simulator mode: return synthetic GeoCOM reply
+            sim_reply = f"%R1P,0,0:0 (SIMULATED REPLY FOR {wire_cmd.strip()})"
+            self.txt_output.appendPlainText(f"Sent-> {wire_cmd.strip()}\nReceived-> {sim_reply}")
+            return sim_reply
+
+        rx = self.driver.send_raw(wire_cmd)
+        self.txt_output.appendPlainText(f"Sent-> {wire_cmd.strip()}\nReceived-> {rx.strip()}")
+        return rx
+
+    def _on_send_clicked(self) -> None:
+        try:
+            self.execute_preset_command(self.cbo_commands.currentText())
+        except Exception as exc:
+            QMessageBox.warning(self, "Debug Command Error", str(exc))
+
+    def _on_copy_clipboard(self) -> None:
+        from PySide6.QtWidgets import QApplication
+        clip = QApplication.clipboard()
+        if clip is not None:
+            clip.setText(self.txt_output.toPlainText())
+
+
+class AboutDialog(QDialog):
+    """
+    Replicates frmAbout (0x00439808 - 'About EDM'):
+    Displays EDM 3.2 / Modern EDM 3.3.0 credits for Harold L. Dibble and Shannon JP. McPherron.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("About EDM")
+        self.resize(380, 220)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("EDM 3.2 / Modern EDM 3.3.0")
+        title.setAlignment(Qt.AlignCenter)
+        authors = QLabel("Harold L. Dibble\nShannon JP. McPherron")
+        authors.setAlignment(Qt.AlignCenter)
+        copy_lbl = QLabel("Copyright (c) 2023 OldStoneAge.com\nModern Cross-Platform Python/PySide6 Edition")
+        copy_lbl.setAlignment(Qt.AlignCenter)
+
+        layout.addWidget(title)
+        layout.addWidget(authors)
+        layout.addWidget(copy_lbl)
+
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        layout.addWidget(ok_btn)
+
+
+class SetupLogFilesDialog(QDialog):
+    """
+    Replicates frmSetupLogFiles (0x0043ae4c / FUN_00557960 - 'Setup Log Files'):
+    - chkTSLog ('Log total station communications')
+    - txtTSLog (TSLogFile path; double-click or Browse button opens file dialog)
+    - cmdClearTSLog ('Clear file' - truncates TSLogFile)
+    - chkGeneralLog ('Log setups and other program options')
+    - txtGeneralLog (GeneralLogFile path; double-click or Browse button opens file dialog)
+    - cmdClearGeneralLog ('Clear file' - truncates GeneralLogFile)
+    """
+
+    def __init__(
+        self,
+        cfg: EDMConfig,
+        default_dir: Optional[Path] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Setup Log Files")
+        self.resize(580, 320)
+        self.cfg = cfg
+        base = default_dir or Path.cwd()
+
+        default_ts = cfg.ts_log_file or str(base / "ts_comm.log")
+        default_gen = cfg.general_log_file or str(base / "general_edm.log")
+
+        root = QVBoxLayout(self)
+
+        # Total Station Communications Log Box
+        ts_box = QGroupBox("Total Station Communications Log")
+        ts_layout = QVBoxLayout(ts_box)
+        self.chk_ts_log = QCheckBox("Log total station communications")
+        self.chk_ts_log.setChecked(cfg.use_ts_log)
+        ts_layout.addWidget(self.chk_ts_log)
+
+        ts_row = QHBoxLayout()
+        self.txt_ts_log = QLineEdit(default_ts)
+        self.txt_ts_log.setToolTip("(double click in the box or click Browse to open a file browser)")
+        btn_browse_ts = QPushButton("Browse...")
+        btn_browse_ts.clicked.connect(self._browse_ts_log)
+        btn_clear_ts = QPushButton("Clear file")
+        btn_clear_ts.clicked.connect(self.clear_ts_log_file)
+        ts_row.addWidget(self.txt_ts_log, 1)
+        ts_row.addWidget(btn_browse_ts)
+        ts_row.addWidget(btn_clear_ts)
+        ts_layout.addLayout(ts_row)
+        ts_layout.addWidget(QLabel("(double click in the box or click Browse to open a file browser)"))
+        root.addWidget(ts_box)
+
+        # General Setups & Options Log Box
+        gen_box = QGroupBox("General Program & Setup Log")
+        gen_layout = QVBoxLayout(gen_box)
+        self.chk_general_log = QCheckBox("Log setups and other program options")
+        self.chk_general_log.setChecked(cfg.use_general_log)
+        gen_layout.addWidget(self.chk_general_log)
+
+        gen_row = QHBoxLayout()
+        self.txt_general_log = QLineEdit(default_gen)
+        self.txt_general_log.setToolTip("(double click in the box or click Browse to open a file browser)")
+        btn_browse_gen = QPushButton("Browse...")
+        btn_browse_gen.clicked.connect(self._browse_general_log)
+        btn_clear_gen = QPushButton("Clear file")
+        btn_clear_gen.clicked.connect(self.clear_general_log_file)
+        gen_row.addWidget(self.txt_general_log, 1)
+        gen_row.addWidget(btn_browse_gen)
+        gen_row.addWidget(btn_clear_gen)
+        gen_layout.addLayout(gen_row)
+        gen_layout.addWidget(QLabel("(double click in the box or click Browse to open a file browser)"))
+        root.addWidget(gen_box)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK (Save)")
+        ok_btn.clicked.connect(self._on_save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        root.addLayout(btn_row)
+
+    def _browse_ts_log(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Select Total Station Log File", self.txt_ts_log.text(), "Log Files (*.log *.txt)"
+        )
+        if path:
+            self.txt_ts_log.setText(path)
+
+    def _browse_general_log(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Select General Log File", self.txt_general_log.text(), "Log Files (*.log *.txt)"
+        )
+        if path:
+            self.txt_general_log.setText(path)
+
+    def clear_ts_log_file(self) -> None:
+        """Replicates cmdClearTSLog ('Clear file') on frmSetupLogFiles."""
+        p = Path(self.txt_ts_log.text().strip())
+        if p.parent.exists():
+            p.write_text("", encoding="utf-8")
+
+    def clear_general_log_file(self) -> None:
+        """Replicates cmdClearGeneralLog ('Clear file') on frmSetupLogFiles."""
+        p = Path(self.txt_general_log.text().strip())
+        if p.parent.exists():
+            p.write_text("", encoding="utf-8")
+
+    @staticmethod
+    def append_log_entry(log_path: str | Path, message: str) -> None:
+        """Appends a timestamped line to the specified log file if log_path is non-empty."""
+        clean = str(log_path).strip()
+        if not clean:
+            return
+        import datetime
+        p = Path(clean)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message.rstrip()}\n")
+
+    def _on_save(self) -> None:
+        self.cfg.use_ts_log = self.chk_ts_log.isChecked()
+        self.cfg.ts_log_file = self.txt_ts_log.text().strip()
+        self.cfg.use_general_log = self.chk_general_log.isChecked()
+        self.cfg.general_log_file = self.txt_general_log.text().strip()
+        self.accept()
+
+
+class CreateDefaultProjectDialog(QDialog):
+    """
+    Replicates frmDefault (0x0043db0c / FUN_005039a0 - 'Create a Default CFG'):
+    - CFG Filename (cfgfiletext, default: Survey.CFG)
+    - Database Name (databasetext, default: Survey.sqlite / Survey.MDB)
+    - Points Table (pointsfiletext, default: Points)
+    - Total Station Type (totalstationmenu: Topcon, Leica, Wild, Wild2, Leica_AutoTilt, Builder, Sokkia, Nikon, Simulation, None)
+    - COM Port (comportmenu: COM1..COM20)
+    - Baud Rate (baudratemenu: 1200, 2400, 4800, 9600, 19200)
+    - Parity (paritymenu: Even, Odd, None)
+    - Data Bits (databitmenu: 7, 8)
+    - Stop Bits (stopbitmenu: 1, 2)
+    - Write (Command1) & Cancel (Command2)
+    Enforces exact decompiled validation strings:
+    - 'Please supply a CFG filename.' (0x004380c8)
+    - 'Please supply a database filename.' (0x00438108)
+    - 'Please supply a points table name.' (0x00438154)
+    - 'If the total station type is not set to Simulation, the baud rate, parity, data bits and stop bits must be set.' (0x00438264)
+    """
+
+    def __init__(
+        self,
+        default_dir: Optional[Path] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Create a Default CFG")
+        self.resize(620, 520)
+        base = default_dir or Path.cwd()
+        self.created_cfg_path: Optional[Path] = None
+        self.created_db_path: Optional[Path] = None
+        self.created_cfg: Optional[EDMConfig] = None
+
+        root = QVBoxLayout(self)
+
+        intro_lbl = QLabel(
+            "This form lets you create a default CFG file and database that can be used to "
+            "immediately start recording points. It is based generally on the CFG that we "
+            "use for excavating Paleolithic sites.\n\n"
+            "Once you press Write, the program will create the CFG and database. An empty points "
+            "table will be created as well. The program will add a datums table and a prisms "
+            "table with default entries. All of these things can be modified using the menu "
+            "options in this program."
+        )
+        intro_lbl.setWordWrap(True)
+        root.addWidget(intro_lbl)
+
+        form = QFormLayout()
+
+        cfg_row = QHBoxLayout()
+        self.txt_cfg = QLineEdit(str(base / "Survey.CFG"))
+        btn_browse_cfg = QPushButton("Browse...")
+        btn_browse_cfg.clicked.connect(self._browse_cfg)
+        cfg_row.addWidget(self.txt_cfg, 1)
+        cfg_row.addWidget(btn_browse_cfg)
+
+        db_row = QHBoxLayout()
+        self.txt_db = QLineEdit(str(base / "Survey.sqlite"))
+        btn_browse_db = QPushButton("Browse...")
+        btn_browse_db.clicked.connect(self._browse_db)
+        db_row.addWidget(self.txt_db, 1)
+        db_row.addWidget(btn_browse_db)
+
+        self.txt_points_table = QLineEdit("Points")
+
+        self.cbo_station = QComboBox()
+        self.cbo_station.addItems([
+            "Simulator",
+            "Topcon",
+            "Leica",
+            "Wild",
+            "Wild2",
+            "Leica_AutoTilt",
+            "Builder",
+            "Sokkia",
+            "Nikon",
+            "None",
+        ])
+
+        self.cbo_com = QComboBox()
+        self.cbo_com.addItems([f"COM{i}" for i in range(1, 21)])
+
+        self.cbo_baud = QComboBox()
+        self.cbo_baud.setEditable(True)
+        self.cbo_baud.addItems(["1200", "2400", "4800", "9600", "19200"])
+        self.cbo_baud.setCurrentText("1200")
+
+        self.cbo_parity = QComboBox()
+        self.cbo_parity.setEditable(True)
+        self.cbo_parity.addItems(["Even", "Odd", "None"])
+        self.cbo_parity.setCurrentText("Even")
+
+        self.cbo_databits = QComboBox()
+        self.cbo_databits.setEditable(True)
+        self.cbo_databits.addItems(["7", "8"])
+        self.cbo_databits.setCurrentText("7")
+
+        self.cbo_stopbits = QComboBox()
+        self.cbo_stopbits.setEditable(True)
+        self.cbo_stopbits.addItems(["1", "2"])
+        self.cbo_stopbits.setCurrentText("1")
+
+        form.addRow("CFG Filename :", cfg_row)
+        form.addRow("Database Name :", db_row)
+        form.addRow("Points Table :", self.txt_points_table)
+        form.addRow("Total Station Type :", self.cbo_station)
+        form.addRow("COM Port :", self.cbo_com)
+        form.addRow("Baud Rate :", self.cbo_baud)
+        form.addRow("Parity :", self.cbo_parity)
+        form.addRow("Data Bits :", self.cbo_databits)
+        form.addRow("Stop Bits :", self.cbo_stopbits)
+        root.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        write_btn = QPushButton("Write")
+        write_btn.clicked.connect(self._on_write)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(write_btn)
+        btn_row.addWidget(cancel_btn)
+        root.addLayout(btn_row)
+
+    def _browse_cfg(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Create New CFG file", self.txt_cfg.text(), "CFG Files (*.cfg *.CFG)"
+        )
+        if path:
+            self.txt_cfg.setText(path)
+
+    def _browse_db(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Create New Database", self.txt_db.text(), "SQLite / Site Files (*.sqlite *.db *.mdb)"
+        )
+        if path:
+            self.txt_db.setText(path)
+
+    def write_default_project(
+        self,
+        cfg_path_str: Optional[str] = None,
+        db_path_str: Optional[str] = None,
+        points_table_str: Optional[str] = None,
+        station_type_str: Optional[str] = None,
+        com_port_str: Optional[str] = None,
+        baud_str: Optional[str] = None,
+        parity_str: Optional[str] = None,
+        databits_str: Optional[str] = None,
+        stopbits_str: Optional[str] = None,
+    ) -> Tuple[Path, Path, EDMConfig]:
+        """
+        Programmatic helper matching frmDefault Write (Command1_Click):
+        Validates inputs, creates the Paleolithic default .CFG file via save_legacy_cfg_file,
+        and initializes the database with default Datums ('Main'), Prisms ('Zero', '10cm'),
+        and Units ('Unit1', 'Unit2').
+        """
+        c_str = (cfg_path_str if cfg_path_str is not None else self.txt_cfg.text()).strip()
+        d_str = (db_path_str if db_path_str is not None else self.txt_db.text()).strip()
+        pt_str = (points_table_str if points_table_str is not None else self.txt_points_table.text()).strip()
+        st_str = (station_type_str if station_type_str is not None else self.cbo_station.currentText()).strip()
+        com_str = (com_port_str if com_port_str is not None else self.cbo_com.currentText()).strip()
+        b_str = (baud_str if baud_str is not None else self.cbo_baud.currentText()).strip()
+        p_str = (parity_str if parity_str is not None else self.cbo_parity.currentText()).strip()
+        db_bits = (databits_str if databits_str is not None else self.cbo_databits.currentText()).strip()
+        sb_bits = (stopbits_str if stopbits_str is not None else self.cbo_stopbits.currentText()).strip()
+
+        if not c_str:
+            raise ValueError("Please supply a CFG filename.")
+        if not d_str:
+            raise ValueError("Please supply a database filename.")
+        if not pt_str:
+            raise ValueError("Please supply a points table name.")
+
+        if st_str.upper() not in ("SIMULATOR", "SIMULATION", "NONE"):
+            if not (b_str and p_str and db_bits and sb_bits):
+                raise ValueError(
+                    "If the total station type is not set to Simulation, the baud rate, "
+                    "parity, data bits and stop bits must be set."
+                )
+
+        baud_val = int(b_str or "1200")
+        parity_char = p_str.upper()[0] if p_str else "E"
+        bytesize_val = int(db_bits or "7")
+        stopbits_val = int(sb_bits or "1")
+
+        cfg_path = Path(c_str)
+        db_path = Path(d_str)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cfg = build_default_paleolithic_cfg(
+            cfg_filename=str(cfg_path),
+            db_filename=str(db_path),
+            points_table=pt_str,
+            station_type=st_str,
+            com_port=com_str,
+            baudrate=baud_val,
+            parity=parity_char,
+            bytesize=bytesize_val,
+            stopbits=stopbits_val,
+        )
+        save_legacy_cfg_file(cfg, cfg_path)
+
+        # Initialize the new database with frmDefault's exact default entries (0x00438544-0x004385a0):
+        # Prisms: 'Zero' (0.0m, 0.0m) and '10cm' (0.10m, 0.0m)
+        # Datums: 'Main' (100.0, 100.0, 10.0)
+        # Units: 'Unit1' and 'Unit2'
+        if db_path.exists():
+            db_path.unlink()
+        new_db = EDMDatabase(db_path)
+        new_db.upsert_datum(Datum("Main", 100.000, 100.000, 10.000, "Default Main Datum"))
+        new_db.upsert_prism(Prism("Zero", 0.000, 0.000, "Zero Prism"))
+        new_db.upsert_prism(Prism("10cm", 0.100, 0.000, "10cm Pin Pole"))
+        new_db.upsert_unit(
+            ExcavationUnit("Unit1", shape="RECT", min_x=100.0, min_y=100.0, max_x=101.0, max_y=101.0)
+        )
+        new_db.upsert_unit(
+            ExcavationUnit("Unit2", shape="RECT", min_x=101.0, min_y=100.0, max_x=102.0, max_y=101.0)
+        )
+        new_db.close()
+
+        self.created_cfg_path = cfg_path
+        self.created_db_path = db_path
+        self.created_cfg = cfg
+        return cfg_path, db_path, cfg
+
+    def _on_write(self) -> None:
+        try:
+            self.write_default_project()
+            self.accept()
+        except Exception as exc:
+            QMessageBox.warning(self, "Create Default CFG Error", str(exc))
+
+

@@ -404,7 +404,460 @@ def test_main_window_ui_wiring_offscreen(tmp_path: Path) -> None:
     assert restored["LEVEL"] == "1"
 
     win.close()
+    win.deleteLater()
     win.db.close()
+    app.processEvents()
+
+
+def test_cfg_field_and_button_editor_dialogs_offscreen(tmp_path: Path) -> None:
+    """
+    Tests CFGFieldEditorDialog (frmEditField replica) and SpeedButtonEditorDialog (frmButtons replica):
+    - Adding fields, duplicate field rejection, 30-field cap, quick-add V/H/SlopeD & Datum Info
+    - Editing 6-button slots, shortcut conflict detection, Clear Button, and saving back to EDMConfig
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from ui.dialogs import CFGFieldEditorDialog, SpeedButtonEditorDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg_file = Path(__file__).resolve().parent.parent / "sample_excavation.cfg"
+    cfg = load_cfg_file(cfg_file)
+
+    # 1. Test CFGFieldEditorDialog (frmEditField)
+    field_dlg = CFGFieldEditorDialog(cfg)
+    initial_count = len(field_dlg.fields)
+    added = field_dlg.add_field_programmatically(
+        name="MATERIAL",
+        field_type="MENU",
+        prompt="Raw Material",
+        length=16,
+        carry=True,
+        menu_items=["FLINT", "QUARTZ", "OBSIDIAN"],
+        default="FLINT",
+    )
+    assert added.name == "MATERIAL"
+    assert len(field_dlg.fields) == initial_count + 1
+
+    # Duplicate field name must raise ValueError('Duplicate field name.')
+    try:
+        field_dlg.add_field_programmatically(name="material")
+        raise AssertionError("Expected duplicate field name ValueError")
+    except ValueError as e:
+        assert "Duplicate field name." in str(e)
+
+    # Quick-add angles and datum info
+    field_dlg._on_quick_add_angles()
+    field_dlg._on_quick_add_datum_info()
+    names_upper = {f.name.upper() for f in field_dlg.fields}
+    assert {"VANGLE", "HANGLE", "SLOPED", "DATUMNAME", "DATUMX", "DATUMY", "DATUMZ"}.issubset(names_upper)
+
+    field_dlg._on_save_and_close()
+    assert any(f.name == "MATERIAL" for f in cfg.fields)
+    field_dlg.close()
+    field_dlg.deleteLater()
+
+    # 2. Test SpeedButtonEditorDialog (frmButtons)
+    btn_dlg = SpeedButtonEditorDialog(cfg)
+    btn_dlg.select_slot(1)
+    btn_dlg._on_caption_edited("Flint Flake")
+    btn_dlg.set_slot_shortcut(1, "F")
+    btn_dlg.set_slot_field_value(1, "CODE", "LITHIC")
+    btn_dlg.set_slot_field_value(1, "MATERIAL", "FLINT")
+
+    # Configure slot 2 and test shortcut conflict against slot 1 ('F')
+    btn_dlg.select_slot(2)
+    btn_dlg._on_caption_edited("Bone Fragment")
+    try:
+        btn_dlg.set_slot_shortcut(2, "f")
+        raise AssertionError("Expected shortcut conflict ValueError")
+    except ValueError as e:
+        assert "This shortcut conflicts with another one already defined." in str(e)
+
+    btn_dlg.set_slot_shortcut(2, "B")
+    btn_dlg.set_slot_field_value(2, "CODE", "BONE")
+
+    # Test Clear Button on slot 2
+    btn_dlg.clear_slot(2)
+    assert btn_dlg.slots[2].title == "Setup"
+    assert btn_dlg.slots[2].field_values == {}
+
+    # Re-populate slot 2 and save
+    btn_dlg.set_slot_field_value(2, "CODE", "BONE")
+    btn_dlg._on_caption_edited("Bone Fragment")
+    btn_dlg._on_save_and_close()
+
+    assert len(cfg.button_macros) >= 2
+    assert cfg.button_macros[0].title == "Flint Flake"
+    assert cfg.button_macros[0].shortcut == "F"
+    assert cfg.button_macros[0].field_values["MATERIAL"] == "FLINT"
+    btn_dlg.close()
+    btn_dlg.deleteLater()
+    app.processEvents()
+
+
+def test_datagrid_and_field_filter_dialogs_offscreen(tmp_path: Path) -> None:
+    """
+    Tests FieldFilterDialog (frmFilter replica) and DataGridDialog (frmDataGrid replica):
+    - Distinct field value queries (get_distinct_field_values)
+    - Field=Value filtering and Current Station filtering (filter_points)
+    - Column visibility toggling in Display Fields checklist (set_column_checked)
+    - Inline cell editing of both core columns (X, UNIT) and custom .CFG fields (CODE, LEVEL)
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from ui.dialogs import DataGridDialog, FieldFilterDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg_file = Path(__file__).resolve().parent.parent / "sample_excavation.cfg"
+    cfg = load_cfg_file(cfg_file)
+    db = EDMDatabase(tmp_path / "datagrid_test.sqlite")
+
+    stn1 = StationState(
+        setup_method="Direct",
+        station_name="STN1",
+        x=100.0,
+        y=100.0,
+        z=10.0,
+        instrument_height=1.5,
+    )
+    stn2 = StationState(
+        setup_method="Direct",
+        station_name="STN2",
+        x=200.0,
+        y=200.0,
+        z=15.0,
+        instrument_height=1.5,
+    )
+    prism = Prism("Mini", 0.10, 0.017)
+
+    id1 = db.record_point(
+        "N100E100", "1", 0, 100.5, 100.5, 9.8, prism, 1.5, 45.0, 90.0, stn1,
+        {"CODE": "LITHIC", "LEVEL": "1", "EXCAVATOR": "HD"},
+    )
+    id2 = db.record_point(
+        "N100E100", "2", 0, 100.7, 100.8, 9.7, prism, 1.6, 50.0, 90.0, stn1,
+        {"CODE": "BONE", "LEVEL": "2A", "EXCAVATOR": "SPM"},
+    )
+    id3 = db.record_point(
+        "N100E101", "1", 0, 201.0, 201.0, 14.8, prism, 1.4, 60.0, 90.0, stn2,
+        {"CODE": "LITHIC", "LEVEL": "2B", "EXCAVATOR": "HD"},
+    )
+
+    # 1. Test FieldFilterDialog (frmFilter)
+    filter_dlg = FieldFilterDialog(db, cfg)
+    distinct_codes = db.get_distinct_field_values("CODE")
+    assert distinct_codes == ["BONE", "LITHIC"]
+
+    filter_dlg._on_field_selected("CODE")
+    assert filter_dlg.lst_vals.count() == 2
+
+    try:
+        filter_dlg.select_filter("CODE", "")
+        raise AssertionError("Expected empty filter value ValueError")
+    except ValueError as e:
+        assert "Select field and value to filter by." in str(e)
+
+    filter_dlg.select_filter("CODE", "BONE")
+    assert (filter_dlg.selected_field, filter_dlg.selected_value) == ("CODE", "BONE")
+    filter_dlg.close()
+    filter_dlg.deleteLater()
+
+    # 2. Test DataGridDialog (frmDataGrid)
+    db.save_station_state(stn1)
+    grid_dlg = DataGridDialog(db, cfg, filter_current_station_only=False)
+    assert grid_dlg.grid.rowCount() == 3
+
+    # Filter by CODE = 'LITHIC' -> should show 2 rows (id1 and id3)
+    grid_dlg.apply_filter("CODE", "LITHIC")
+    assert grid_dlg.grid.rowCount() == 2
+
+    # Enable 'Show only Points from Current Station' (stn1) -> should narrow to 1 row (id1)
+    grid_dlg.chk_station_filter.setChecked(True)
+    assert grid_dlg.grid.rowCount() == 1
+
+    # Clear filters -> back to 3 rows
+    grid_dlg.chk_station_filter.setChecked(False)
+    grid_dlg.clear_filter()
+    assert grid_dlg.grid.rowCount() == 3
+
+    # Test hiding/showing a column via Display Fields checklist (lstFields)
+    x_col_idx = grid_dlg.all_columns.index("X")
+    grid_dlg.set_column_checked("X", False)
+    assert grid_dlg.grid.isColumnHidden(x_col_idx) is True
+    grid_dlg.set_column_checked("X", True)
+    assert grid_dlg.grid.isColumnHidden(x_col_idx) is False
+
+    # Test inline cell editing on row 0 (id1): update X coordinate and CODE extra field
+    grid_dlg.edit_cell_programmatically(0, "X", "101.2500")
+    grid_dlg.edit_cell_programmatically(0, "CODE", "CHARCOAL")
+
+    pts_after = {p["doc_id"]: p for p in db.list_points()}
+    assert math.isclose(pts_after[id1]["x"], 101.2500, abs_tol=1e-6)
+    assert pts_after[id1]["extra_fields"]["CODE"] == "CHARCOAL"
+    assert pts_after[id2]["extra_fields"]["CODE"] == "BONE"
+    assert pts_after[id3]["unit"] == "N100E101"
+
+    grid_dlg.close()
+    grid_dlg.deleteLater()
+    db.close()
+    app.processEvents()
+
+
+def test_context_defaults_and_manual_shot_dialogs_offscreen(tmp_path: Path) -> None:
+    """
+    Tests ContextDefaultsDialog (frmSubUnits replica) and ManualShotDialog (frmManualshot replica):
+    - Setting Master Variable ('LEVEL') and Dependent Variables ('CODE', 'EXCAVATOR')
+    - Associating specific dependent values with Master Values ('1' vs '2B')
+    - Auto-updating dependent defaults when a shot is recorded (UpdateDependentVar)
+    - Manual Shot entry in both 'ANGLES' (DDD.MMSS + SlopeDist + PoleHeight) and 'XYZ' modes
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from ui.dialogs import ContextDefaultsDialog, ManualShotDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg_file = Path(__file__).resolve().parent.parent / "sample_excavation.cfg"
+    cfg = load_cfg_file(cfg_file)
+    db = EDMDatabase(tmp_path / "ctx_manual_test.sqlite")
+
+    # 1. Test ContextDefaultsDialog (frmSubUnits)
+    ctx_dlg = ContextDefaultsDialog(db, cfg)
+    ctx_dlg._on_master_changed("LEVEL")
+    ctx_dlg.set_slave_checked("CODE", True)
+    ctx_dlg.set_slave_checked("EXCAVATOR", True)
+    ctx_dlg.set_rule_value("1", "CODE", "TOPO")
+    ctx_dlg.set_rule_value("1", "EXCAVATOR", "HD")
+    ctx_dlg.set_rule_value("2B", "CODE", "BONE")
+    ctx_dlg.set_rule_value("2B", "EXCAVATOR", "SPM")
+    ctx_dlg._on_save()
+    ctx_dlg.close()
+    ctx_dlg.deleteLater()
+
+    assert db.get_context_dependent_values("1") == {"CODE": "TOPO", "EXCAVATOR": "HD"}
+    assert db.get_context_dependent_values("2B") == {"CODE": "BONE", "EXCAVATOR": "SPM"}
+
+    # Verify UpdateDependentVar updates stored rule when user edits a dependent field
+    db.update_context_default_rule("2B", {"CODE": "LITHIC", "EXCAVATOR": "JD"})
+    assert db.get_context_dependent_values("2B") == {"CODE": "LITHIC", "EXCAVATOR": "JD"}
+
+    # 2. Test ManualShotDialog (frmManualshot) - Angles mode & XYZ mode
+    man_dlg = ManualShotDialog(default_prism_height=1.50, default_mode="ANGLES")
+
+    try:
+        man_dlg.submit_angles("", "90.0000", "10.0")
+        raise AssertionError("Expected missing angle ValueError")
+    except ValueError as e:
+        assert "Enter a vertical angle, horizontal angle, and slope distance." in str(e)
+
+    obs_ang = man_dlg.submit_angles("90.0000", "90.0000", "12.500", "1.500")
+    assert math.isclose(obs_ang.slope_distance, 12.500, abs_tol=1e-6)
+    assert math.isclose(obs_ang.horizontal_angle_deg, 90.0, abs_tol=1e-5)
+    assert math.isclose(obs_ang.vertical_angle_deg, 90.0, abs_tol=1e-5)
+    assert obs_ang.direct_xyz is None
+
+    try:
+        man_dlg.submit_xyz("100.0", "bad_float", "10.0")
+        raise AssertionError("Expected non-numeric XYZ ValueError")
+    except ValueError as e:
+        assert "Enter coordinates as numeric values." in str(e)
+
+    obs_xyz = man_dlg.submit_xyz("105.250", "204.500", "9.850")
+    assert obs_xyz.direct_xyz == (105.250, 204.500, 9.850)
+
+    man_dlg.close()
+    man_dlg.deleteLater()
+    db.close()
+    app.processEvents()
+
+
+def test_status_debug_and_about_dialogs_offscreen(tmp_path: Path) -> None:
+    """
+    Tests EDMStatusDialog (frmStatus replica), DebugStationDialog (frmDebug replica),
+    and AboutDialog (frmAbout replica):
+    - Verifies Station X, Y, optical center Z, COM port, settings, and record count on EDMStatusDialog
+    - Verifies Initialize, X-Shot (HAngle, VAngle, SlopeD, X, Y, Z), and all 5 GeoCOM preset commands on DebugStationDialog
+    - Verifies unrecognized/empty command validation on DebugStationDialog
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from drivers.total_station import SimulatorDriver
+    from ui.dialogs import AboutDialog, DebugStationDialog, EDMStatusDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg_file = Path(__file__).resolve().parent.parent / "sample_excavation.cfg"
+    cfg = load_cfg_file(cfg_file)
+    db = EDMDatabase(tmp_path / "status_debug_test.sqlite")
+
+    stn = StationState(
+        setup_method="Direct",
+        station_name="D1",
+        x=100.0,
+        y=200.0,
+        z=10.0,
+        instrument_height=1.500,
+    )
+    db.save_station_state(stn)
+
+    # 1. Test EDMStatusDialog (frmStatus)
+    status_dlg = EDMStatusDialog(db, cfg, cfg_path=str(cfg_file), ini_path="edm.ini")
+    assert status_dlg.txt_station_x.text() == "100.000"
+    assert status_dlg.txt_station_y.text() == "200.000"
+    assert status_dlg.txt_station_z.text() == "11.500"  # Optical center Z = 10.0 + 1.5
+    assert "19200,N,8,1" in status_dlg.txt_settings.text()
+    status_dlg.close()
+    status_dlg.deleteLater()
+
+    # 2. Test DebugStationDialog (frmDebug)
+    sim_drv = SimulatorDriver()
+    sim_drv.queue_observation(slope_distance=10.0, hz_deg=90.0, v_deg=90.0)
+    dbg_dlg = DebugStationDialog(db, cfg, sim_drv)
+
+    init_out = dbg_dlg.run_initialize()
+    assert init_out == "OK"
+
+    obs = dbg_dlg.run_xshot()
+    assert math.isclose(obs.slope_distance, 10.0, abs_tol=1e-6)
+    assert dbg_dlg.txt_x.text() == "110.000"
+    assert dbg_dlg.txt_y.text() == "200.000"
+    assert dbg_dlg.txt_z.text() == "11.500"
+
+    for preset in DebugStationDialog.PRESET_COMMANDS:
+        reply = dbg_dlg.execute_preset_command(preset)
+        assert "%R1P,0,0:0" in reply
+
+    try:
+        dbg_dlg.execute_preset_command("")
+        raise AssertionError("Expected empty command ValueError")
+    except ValueError as e:
+        assert "Select a command from the dropdown next to this button." in str(e)
+
+    try:
+        dbg_dlg.execute_preset_command("INVALID_CMD")
+        raise AssertionError("Expected unrecognized command ValueError")
+    except ValueError as e:
+        assert "Error: Unrecognize command selected." in str(e)
+
+    dbg_dlg.close()
+    dbg_dlg.deleteLater()
+
+    # 3. Test AboutDialog (frmAbout)
+    about_dlg = AboutDialog()
+    about_dlg.close()
+    about_dlg.deleteLater()
+
+    db.close()
+    app.processEvents()
+
+
+def test_setup_log_files_and_create_default_project_dialogs_offscreen(tmp_path: Path) -> None:
+    """
+    Tests SetupLogFilesDialog (frmSetupLogFiles replica) and CreateDefaultProjectDialog (frmDefault replica):
+    - Enabling UseTSLog & UseGeneralLog, writing timestamped entries, and clearing log files
+    - Validating missing CFG/DB/PointsTable and non-Simulation serial parameters on CreateDefaultProjectDialog
+    - Creating a Paleolithic default .CFG and SQLite database (with 'Main' datum, 'Zero'/'10cm' prisms, 'Unit1'/'Unit2' units)
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from ui.dialogs import CreateDefaultProjectDialog, SetupLogFilesDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg_file = Path(__file__).resolve().parent.parent / "sample_excavation.cfg"
+    cfg = load_cfg_file(cfg_file)
+
+    # 1. Test SetupLogFilesDialog (frmSetupLogFiles)
+    log_dlg = SetupLogFilesDialog(cfg, default_dir=tmp_path)
+    ts_log = tmp_path / "ts_comm_test.log"
+    gen_log = tmp_path / "general_test.log"
+    log_dlg.chk_ts_log.setChecked(True)
+    log_dlg.txt_ts_log.setText(str(ts_log))
+    log_dlg.chk_general_log.setChecked(True)
+    log_dlg.txt_general_log.setText(str(gen_log))
+    log_dlg._on_save()
+
+    assert cfg.use_ts_log is True
+    assert cfg.ts_log_file == str(ts_log)
+    assert cfg.use_general_log is True
+    assert cfg.general_log_file == str(gen_log)
+
+    SetupLogFilesDialog.append_log_entry(ts_log, "TX %R1Q,2008:1,1")
+    SetupLogFilesDialog.append_log_entry(gen_log, "Station initialized Direct over Main")
+    assert "TX %R1Q,2008:1,1" in ts_log.read_text(encoding="utf-8")
+    assert "Station initialized Direct over Main" in gen_log.read_text(encoding="utf-8")
+
+    log_dlg.clear_ts_log_file()
+    log_dlg.clear_general_log_file()
+    assert ts_log.read_text(encoding="utf-8") == ""
+    assert gen_log.read_text(encoding="utf-8") == ""
+
+    log_dlg.close()
+    log_dlg.deleteLater()
+
+    # 2. Test CreateDefaultProjectDialog (frmDefault)
+    def_dlg = CreateDefaultProjectDialog(default_dir=tmp_path)
+
+    try:
+        def_dlg.write_default_project(cfg_path_str="", db_path_str="a.sqlite", points_table_str="Points")
+        raise AssertionError("Expected missing CFG filename ValueError")
+    except ValueError as e:
+        assert "Please supply a CFG filename." in str(e)
+
+    try:
+        def_dlg.write_default_project(cfg_path_str="a.cfg", db_path_str="", points_table_str="Points")
+        raise AssertionError("Expected missing DB filename ValueError")
+    except ValueError as e:
+        assert "Please supply a database filename." in str(e)
+
+    try:
+        def_dlg.write_default_project(cfg_path_str="a.cfg", db_path_str="a.sqlite", points_table_str="")
+        raise AssertionError("Expected missing Points table ValueError")
+    except ValueError as e:
+        assert "Please supply a points table name." in str(e)
+
+    try:
+        def_dlg.write_default_project(
+            cfg_path_str="a.cfg",
+            db_path_str="a.sqlite",
+            points_table_str="Points",
+            station_type_str="Topcon",
+            baud_str="",
+        )
+        raise AssertionError("Expected non-Simulation serial settings ValueError")
+    except ValueError as e:
+        assert "If the total station type is not set to Simulation" in str(e)
+
+    out_cfg_path = tmp_path / "PaleoSite.CFG"
+    out_db_path = tmp_path / "PaleoSite.sqlite"
+    created_cfg_p, created_db_p, _ = def_dlg.write_default_project(
+        cfg_path_str=str(out_cfg_path),
+        db_path_str=str(out_db_path),
+        points_table_str="Points",
+        station_type_str="Wild2",
+        com_port_str="COM2",
+        baud_str="19200",
+        parity_str="None",
+        databits_str="8",
+        stopbits_str="1",
+    )
+    assert created_cfg_p.exists()
+    assert created_db_p.exists()
+
+    reloaded_cfg = load_cfg_file(created_cfg_p)
+    assert reloaded_cfg.station_type == "Wild2"
+    assert reloaded_cfg.com_port == "COM2"
+    assert reloaded_cfg.baudrate == 19200
+    assert {f.name.upper() for f in reloaded_cfg.fields} >= {"UNIT", "ID", "SUFFIX", "CODE", "LEVEL", "EXCAVATOR"}
+
+    check_db = EDMDatabase(created_db_p)
+    datum_names = {d.name for d in check_db.list_datums()}
+    prism_names = {p.name for p in check_db.list_prisms()}
+    unit_names = {u.name for u in check_db.list_units()}
+    assert "Main" in datum_names
+    assert {"Zero", "10cm"}.issubset(prism_names)
+    assert {"Unit1", "Unit2"}.issubset(unit_names)
+    check_db.close()
+
+    def_dlg.close()
+    def_dlg.deleteLater()
     app.processEvents()
 
 
@@ -461,6 +914,18 @@ class TestEDMUnittestWrapper(unittest.TestCase):
             test_button_macros_and_duplicate_id_and_series_resequencing(tmp_p)
             test_unit_scoped_fields_and_csv_bundle_and_labels(tmp_p)
             test_main_window_ui_wiring_offscreen(tmp_p)
+            test_cfg_field_and_button_editor_dialogs_offscreen(tmp_p)
+            test_datagrid_and_field_filter_dialogs_offscreen(tmp_p)
+            test_context_defaults_and_manual_shot_dialogs_offscreen(tmp_p)
+            test_status_debug_and_about_dialogs_offscreen(tmp_p)
+            test_setup_log_files_and_create_default_project_dialogs_offscreen(tmp_p)
+        import gc
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            app.closeAllWindows()
+            app.processEvents()
+        gc.collect()
 
 
 if __name__ == "__main__":
