@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import copy
 import math
+import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,7 +53,9 @@ from drivers.total_station import (
     SerialConfig,
     TotalStationDriver,
     create_driver,
+    discover_bluetooth_devices,
     dms_encoded_to_radians,
+    parse_transport_endpoint,
 )
 from storage.cfg_parser import (
     EDMConfig,
@@ -61,6 +65,11 @@ from storage.cfg_parser import (
     save_legacy_cfg_file,
 )
 from storage.database import EDMDatabase
+from storage.label_printer import (
+    append_label_to_spool,
+    format_ascii_bag_label,
+    format_zpl_bag_label,
+)
 from survey.math_engine import (
     Datum,
     ExcavationUnit,
@@ -947,6 +956,15 @@ class SpeedButtonEditorDialog(QDialog):
 
 
 class SerialTerminalDialog(QDialog):
+    """
+    Replicates frmTheodolite (0x00438e68) & Connection Manager with full support for:
+    - RS-232 / USB-Serial COM ports (with Baud, Parity, Data Bits, Stop Bits, DTR/RTS, Flow Control, EdmDelayTime, Topcon BCC & Barrel Reversal checks)
+    - Bluetooth Classic SPP Virtual COM & Direct RFCOMM Sockets ('bt://AA:BB:CC:DD:EE:FF:1') + Paired Bluetooth Scanner
+    - Bluetooth Low Energy (BLE) UART ('ble://AA:BB:CC:DD:EE:FF')
+    - Wi-Fi / Ethernet TCP/IP ('tcp://192.168.1.100:5000') & UDP ('udp://127.0.0.1:5005') robotic bridges
+    - Multi-Protocol Virtual Hardware Emulators ('SIMULATOR', 'VIRT-LEICA', 'VIRT-TOPCON', 'VIRT-SOKKIA', 'VIRT-TRIMBLE', 'BT-SIM-LEICA', 'TCP-SIM-STATION')
+    """
+
     def __init__(
         self,
         station_type: str,
@@ -954,8 +972,8 @@ class SerialTerminalDialog(QDialog):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("COM / Bluetooth Settings & Serial Diagnostic Terminal")
-        self.resize(680, 480)
+        self.setWindowTitle("Total Station Connection Manager (Serial / Bluetooth / TCP-IP / Emulator)")
+        self.resize(740, 560)
         self.station_type = station_type
         self.serial_config = serial_config
 
@@ -972,21 +990,39 @@ class SerialTerminalDialog(QDialog):
             "Topcon",
             "Sokkia",
             "Nikon",
+            "Trimble",
+            "Zeiss",
             "Microscribe",
         ])
         self.station_combo.setCurrentText(self.station_type)
 
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItems([
+            "Serial / USB / Bluetooth SPP COM Port",
+            "Bluetooth RFCOMM Direct (bt://MAC:Channel)",
+            "Bluetooth Low Energy UART (ble://MAC)",
+            "Wi-Fi / Ethernet TCP/IP Socket (tcp://host:port)",
+            "UDP Stream Bridge (udp://host:port)",
+            "Virtual Hardware Emulator (SIMULATOR / VIRT-*)",
+        ])
+        self.transport_combo.currentIndexChanged.connect(self._on_transport_mode_changed)
+
         self.port_combo = QComboBox()
         self.port_combo.setEditable(True)
-        self._refresh_ports()
+        self._refresh_ports(include_bt=False)
         self.port_combo.setCurrentText(self.serial_config.port)
 
-        scan_btn = QPushButton("Look for Ports")
-        scan_btn.clicked.connect(self._refresh_ports)
+        scan_btn = QPushButton("Scan COM Ports")
+        scan_btn.clicked.connect(lambda: self._refresh_ports(include_bt=False))
+        scan_bt_btn = QPushButton("Scan Bluetooth Devices")
+        scan_bt_btn.clicked.connect(self._on_scan_bluetooth)
         port_row = QHBoxLayout()
         port_row.addWidget(self.port_combo, 1)
         port_row.addWidget(scan_btn)
+        port_row.addWidget(scan_bt_btn)
 
+        # Serial framing row: Baud, Parity, Data Bits, Stop Bits, Flow Control
+        serial_row = QHBoxLayout()
         self.baud_combo = QComboBox()
         self.baud_combo.addItems(["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"])
         self.baud_combo.setCurrentText(str(self.serial_config.baudrate))
@@ -995,10 +1031,58 @@ class SerialTerminalDialog(QDialog):
         self.parity_combo.addItems(["N", "E", "O"])
         self.parity_combo.setCurrentText(self.serial_config.parity)
 
+        self.bytesize_combo = QComboBox()
+        self.bytesize_combo.addItems(["7", "8"])
+        self.bytesize_combo.setCurrentText(str(self.serial_config.bytesize))
+
+        self.stopbits_combo = QComboBox()
+        self.stopbits_combo.addItems(["1", "2"])
+        self.stopbits_combo.setCurrentText(str(self.serial_config.stopbits))
+
+        self.flow_combo = QComboBox()
+        self.flow_combo.addItems(["NONE", "RTSCTS", "XONXOFF"])
+        self.flow_combo.setCurrentText(getattr(self.serial_config, "flow_control", "NONE"))
+
+        serial_row.addWidget(QLabel("Baud:"))
+        serial_row.addWidget(self.baud_combo)
+        serial_row.addWidget(QLabel("Parity:"))
+        serial_row.addWidget(self.parity_combo)
+        serial_row.addWidget(QLabel("Bits:"))
+        serial_row.addWidget(self.bytesize_combo)
+        serial_row.addWidget(QLabel("Stop:"))
+        serial_row.addWidget(self.stopbits_combo)
+        serial_row.addWidget(QLabel("Flow:"))
+        serial_row.addWidget(self.flow_combo)
+
+        # Hardware flags & EdmDelayTime row (matches frmTheodolite)
+        flags_row = QHBoxLayout()
+        self.chk_dtr = QCheckBox("DTR")
+        self.chk_dtr.setChecked(self.serial_config.dtr)
+        self.chk_rts = QCheckBox("RTS")
+        self.chk_rts.setChecked(self.serial_config.rts)
+        self.chk_bcc = QCheckBox("Verify Topcon BCC")
+        self.chk_bcc.setChecked(self.serial_config.verify_bcc)
+        self.chk_barrel = QCheckBox("Check Barrel Reversal")
+        self.chk_barrel.setChecked(self.serial_config.check_barrel_reversal)
+        self.spn_delay = QDoubleSpinBox()
+        self.spn_delay.setRange(0.0, 10.0)
+        self.spn_delay.setSingleStep(0.1)
+        self.spn_delay.setDecimals(2)
+        self.spn_delay.setValue(self.serial_config.edm_delay_time)
+
+        flags_row.addWidget(self.chk_dtr)
+        flags_row.addWidget(self.chk_rts)
+        flags_row.addWidget(self.chk_bcc)
+        flags_row.addWidget(self.chk_barrel)
+        flags_row.addWidget(QLabel("EDM Delay (s):"))
+        flags_row.addWidget(self.spn_delay)
+        flags_row.addStretch()
+
         form.addRow("Station Protocol:", self.station_combo)
-        form.addRow("Serial / BT Port:", port_row)
-        form.addRow("Baud Rate:", self.baud_combo)
-        form.addRow("Parity:", self.parity_combo)
+        form.addRow("Connection Transport:", self.transport_combo)
+        form.addRow("Port / BT MAC / TCP URI:", port_row)
+        form.addRow("Serial Framing:", serial_row)
+        form.addRow("Protocol Options:", flags_row)
         layout.addLayout(form)
 
         cmd_row = QHBoxLayout()
@@ -1026,21 +1110,54 @@ class SerialTerminalDialog(QDialog):
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
-    def _refresh_ports(self) -> None:
+    def _on_transport_mode_changed(self, idx: int) -> None:
+        presets = {
+            1: "bt://00:11:22:33:44:55:1",
+            2: "ble://00:11:22:33:44:55",
+            3: "tcp://192.168.1.100:5000",
+            4: "udp://127.0.0.1:5005",
+            5: "SIMULATOR",
+        }
+        if idx in presets:
+            self.port_combo.setEditText(presets[idx])
+
+    def _refresh_ports(self, include_bt: bool = False) -> None:
         self.port_combo.clear()
-        for dev, desc in TotalStationDriver.list_available_ports():
+        for dev, desc in TotalStationDriver.list_available_ports(include_bluetooth_scan=include_bt):
             self.port_combo.addItem(desc, dev)
+
+    def _on_scan_bluetooth(self) -> None:
+        bt_devs = discover_bluetooth_devices()
+        self._refresh_ports(include_bt=True)
+        self._append_log(
+            "BLUETOOTH",
+            f"Discovered {len(bt_devs)} Bluetooth SPP / RFCOMM / Simulated endpoint(s): "
+            + ", ".join(d[0] for d in bt_devs),
+        )
+        if bt_devs:
+            self.port_combo.setCurrentText(bt_devs[0][1])
 
     def _append_log(self, direction: str, text: str) -> None:
         self.log_view.appendPlainText(f"[{direction}] {text}")
 
     def build_config(self) -> Tuple[str, SerialConfig]:
-        port_data = self.port_combo.currentData()
-        port_str = port_data if port_data else self.port_combo.currentText().split(" - ")[0].strip()
+        txt = self.port_combo.currentText().strip()
+        port_str = txt.split(" - ")[0].strip() if " - " in txt else txt
+        if not port_str:
+            port_data = self.port_combo.currentData()
+            port_str = str(port_data) if port_data else "SIMULATOR"
         cfg = SerialConfig(
             port=port_str,
-            baudrate=int(self.baud_combo.currentText()),
-            parity=self.parity_combo.currentText(),
+            baudrate=int(self.baud_combo.currentText() or "19200"),
+            bytesize=int(self.bytesize_combo.currentText() or "8"),
+            parity=self.parity_combo.currentText() or "N",
+            stopbits=int(self.stopbits_combo.currentText() or "1"),
+            edm_delay_time=float(self.spn_delay.value()),
+            dtr=self.chk_dtr.isChecked(),
+            rts=self.chk_rts.isChecked(),
+            flow_control=self.flow_combo.currentText() or "NONE",
+            verify_bcc=self.chk_bcc.isChecked(),
+            check_barrel_reversal=self.chk_barrel.isChecked(),
         )
         return self.station_combo.currentText(), cfg
 
@@ -3007,5 +3124,764 @@ class CreateDefaultProjectDialog(QDialog):
             self.accept()
         except Exception as exc:
             QMessageBox.warning(self, "Create Default CFG Error", str(exc))
+
+
+class LabelPrinterDialog(QDialog):
+    """
+    Replicates modPrint / Artifact Bag Label Preview, Spool & Reprint Dialog:
+    - Select any recorded point (defaults to last recorded point)
+    - Switch between Plain-Text ASCII and Zebra ZPL II (Code-39 barcode) formats
+    - Configure Site Name header, number of copies (1..20), and Spool File path
+    - Live preview of the formatted bag label + Reprint / Spool & Clear Spool actions
+    """
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        cfg: EDMConfig,
+        spool_path: Path,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Artifact Bag Label Printer & Reprint")
+        self.resize(660, 500)
+        self.db = db
+        self.cfg = cfg
+        self.spool_path = Path(spool_path)
+        self.points = self.db.list_points()
+
+        root = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.cbo_shots = QComboBox()
+        for p in self.points:
+            code_val = p.get("extra_fields", {}).get("CODE", p.get("extra_fields", {}).get("Code", ""))
+            lvl_val = p.get("extra_fields", {}).get("LEVEL", p.get("extra_fields", {}).get("Level", ""))
+            desc = f"#{p['doc_id']}: {p['unit']} {p['id']}.{p['suffix']} ({code_val} / Lvl {lvl_val})"
+            self.cbo_shots.addItem(desc, p)
+        if self.points:
+            self.cbo_shots.setCurrentIndex(len(self.points) - 1)
+        self.cbo_shots.currentIndexChanged.connect(self._update_preview)
+
+        self.txt_site = QLineEdit(self.cfg.point_table or "EXCAVATION")
+        self.txt_site.textChanged.connect(self._update_preview)
+
+        fmt_row = QHBoxLayout()
+        self.fmt_group = QButtonGroup(self)
+        self.rb_ascii = QRadioButton("Plain-Text ASCII (Code-39 *UNIT-ID-SUFFIX*)")
+        self.rb_zpl = QRadioButton("Zebra ZPL II (^XA ... ^B3N Barcode)")
+        self.rb_ascii.setChecked(True)
+        self.fmt_group.addButton(self.rb_ascii)
+        self.fmt_group.addButton(self.rb_zpl)
+        self.rb_ascii.toggled.connect(self._update_preview)
+        fmt_row.addWidget(self.rb_ascii)
+        fmt_row.addWidget(self.rb_zpl)
+
+        self.spn_copies = QSpinBox()
+        self.spn_copies.setRange(1, 20)
+        self.spn_copies.setValue(1)
+
+        spool_row = QHBoxLayout()
+        self.txt_spool_path = QLineEdit(str(self.spool_path))
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._browse_spool)
+        spool_row.addWidget(self.txt_spool_path, 1)
+        spool_row.addWidget(btn_browse)
+
+        form.addRow("Select Recorded Shot:", self.cbo_shots)
+        form.addRow("Site / Header Title:", self.txt_site)
+        form.addRow("Label Format:", fmt_row)
+        form.addRow("Copies to Print:", self.spn_copies)
+        form.addRow("Spool File / Port:", spool_row)
+        root.addLayout(form)
+
+        prev_box = QGroupBox("Live Label Preview")
+        prev_layout = QVBoxLayout(prev_box)
+        self.txt_preview = QPlainTextEdit()
+        self.txt_preview.setReadOnly(True)
+        prev_layout.addWidget(self.txt_preview, 1)
+        root.addWidget(prev_box, 1)
+
+        btn_row = QHBoxLayout()
+        btn_print = QPushButton("Print / Spool Label(s)")
+        btn_print.clicked.connect(self._on_print_clicked)
+        btn_view_spool = QPushButton("View Spool File")
+        btn_view_spool.clicked.connect(self._on_view_spool)
+        btn_clear_spool = QPushButton("Clear Spool File")
+        btn_clear_spool.clicked.connect(self.clear_spool_file)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+
+        btn_row.addWidget(btn_print)
+        btn_row.addWidget(btn_view_spool)
+        btn_row.addWidget(btn_clear_spool)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        root.addLayout(btn_row)
+
+        self._update_preview()
+
+    def _browse_spool(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Select Label Spool File", self.txt_spool_path.text(), "Label Spool (*.txt *.zpl *.prn)"
+        )
+        if path:
+            self.txt_spool_path.setText(path)
+            self.spool_path = Path(path)
+
+    def current_point_record(self) -> Optional[Dict[str, Any]]:
+        data = self.cbo_shots.currentData()
+        return data if isinstance(data, dict) else None
+
+    def render_current_label(self) -> str:
+        pt = self.current_point_record()
+        if not pt:
+            return "(No recorded points available to preview)"
+        site = self.txt_site.text().strip() or "EXCAVATION"
+        if self.rb_zpl.isChecked():
+            return format_zpl_bag_label(pt, site_name=site)
+        return format_ascii_bag_label(pt, site_name=site)
+
+    def _update_preview(self) -> None:
+        self.txt_preview.setPlainText(self.render_current_label())
+
+    def reprint_selected_shot(self) -> str:
+        pt = self.current_point_record()
+        if not pt:
+            raise ValueError("No recorded shots available to print.")
+        target_path = Path(self.txt_spool_path.text().strip())
+        self.spool_path = target_path
+        site = self.txt_site.text().strip() or "EXCAVATION"
+        use_zpl = self.rb_zpl.isChecked()
+        copies = int(self.spn_copies.value())
+
+        last_payload = ""
+        for _ in range(copies):
+            last_payload = append_label_to_spool(
+                pt, target_path, site_name=site, use_zpl=use_zpl
+            )
+        return last_payload
+
+    def _on_print_clicked(self) -> None:
+        try:
+            self.reprint_selected_shot()
+            QMessageBox.information(
+                self,
+                "Label Spooled",
+                f"Spooled {self.spn_copies.value()} label copy/copies to:\n{self.spool_path}",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Print Label Error", str(exc))
+
+    def _on_view_spool(self) -> None:
+        p = Path(self.txt_spool_path.text().strip())
+        if not p.exists():
+            self.txt_preview.setPlainText("(Spool file does not exist yet)")
+            return
+        self.txt_preview.setPlainText(p.read_text(encoding="utf-8"))
+
+    def clear_spool_file(self) -> None:
+        p = Path(self.txt_spool_path.text().strip())
+        if p.parent.exists():
+            p.write_text("", encoding="utf-8")
+        self._update_preview()
+
+
+class HelpViewerDialog(QDialog):
+    """
+    Replicates frmHelp (0x00438e00 / Help -> Help Topics):
+    Provides a searchable offline field manual covering all total-station setups,
+    .CFG configuration, SpeedButtons, Context-Dependent Defaults, DataGrid filtering,
+    and serial troubleshooting.
+    """
+
+    HELP_TOPICS: Dict[str, str] = {
+        "1. Overview & Quick Start": (
+            "MODERN EDM (EDMWin v3.2 / v3.3.0 Replacement)\n"
+            "=============================================\n"
+            "Modern EDM is a complete cross-platform replacement for the legacy Visual Basic 6 "
+            "EDM Windows program by Harold L. Dibble and Shannon P. McPherron.\n\n"
+            "Quick Start Workflow:\n"
+            "1. Open an existing .CFG file (File -> Open .CFG) or generate a Paleolithic template "
+            "(File -> Create Default CFG and MDB).\n"
+            "2. Select your Total Station protocol and COM port (Station & Edit -> Select Total Station & COM Settings).\n"
+            "3. Initialize the station coordinates (Station & Edit -> Initialize / Verify Station).\n"
+            "4. Press F2 (MEASURE & RECORD SHOT) or click one of the programmable SpeedButtons."
+        ),
+        "2. Station Initialization & Verification": (
+            "INITIALIZING & VERIFYING THE TOTAL STATION\n"
+            "==========================================\n"
+            "Modern EDM supports 4 station initialization methods plus Station Verify:\n\n"
+            "1. Direct / Set Angle: Occupy a known datum nail, enter Instrument Height (HI), "
+            "and optionally preset the horizontal circle (Set Horizontal Angle / Flip 180 Degrees).\n"
+            "2. 1-Point Setup: Occupy an unknown point with known orientation and shoot 1 known datum.\n"
+            "3. 2-Point Backsight: Occupy a known datum and shoot a second backsight datum. Modern EDM "
+            "automatically sets the total station's horizontal angle to the computed azimuth and reports "
+            "the horizontal distance residual between the two datums.\n"
+            "4. Resection (2+ Points): Occupy any free-station point and shoot 2 or more known datums. "
+            "Solves (X, Y, Z) and azimuth orientation via least-squares and reports 2D/3D RMS residuals.\n"
+            "5. Verify Station: Shoot any known datum to check (dX, dY, dZ) and distance error before excavating."
+        ),
+        "3. Recording Shots, +Shot Series & Duplicate IDs": (
+            "RECORDING SHOTS & MULTI-SHOT (+SHOT) SEQUENCES\n"
+            "==============================================\n"
+            "- Single Shot [F2]: Records a point with SUFFIX = 0 and automatically increments ID.\n"
+            "- Multi-Shot Continuation (+Shot): Check 'Continue Multi-Shot Sequence' to record multiple "
+            "points on the same object (e.g. long bone orientation or stratigraphic line). Keeps ID constant "
+            "and increments SUFFIX (0, 1, 2...). You cannot change UNIT in the middle of a series.\n"
+            "- Duplicate ID Resolution (frmDupID): If (UNIT, ID, SUFFIX) already exists, Modern EDM prompts "
+            "you to choose: (1) Convert to alpha ID (e.g. 42a), (2) New ID (max + 1), or (3) Continuation (+Shot).\n"
+            "- Deleting Shots in a Series: Deleting an intermediate shot in a multi-shot series automatically "
+            "resequences all subsequent SUFFIX numbers in that series."
+        ),
+        "4. .CFG Fields & Unit-Scoped Carryover": (
+            "EDITING .CFG FIELDS & UNIT-SCOPED CARRYOVER\n"
+            "===========================================\n"
+            "Use 'Station & Edit -> Add/Edit Fields (.CFG)' to define up to 30 fields:\n"
+            "- Field Types: MENU (dropdown list), TEXT (alphanumeric), NUMERIC (numbers).\n"
+            "- Carry Values to New Shots: Retains the field value after each shot.\n"
+            "- Auto-Increment: Increments numeric ID fields after each non-continuation shot.\n"
+            "- Unit Field (Unitfields=): Saves and restores field values (such as ID, LEVEL, EXCAVATOR) "
+            "independently for each Excavation Unit whenever you switch units."
+        ),
+        "5. Programmable Shot Buttons ([BUTTON1]-[BUTTON6])": (
+            "SPEEDBUTTONS & KEYBOARD SHORTCUTS\n"
+            "=================================\n"
+            "Use 'Station & Edit -> Shot Buttons ([BUTTON1]-[BUTTON6])' to configure up to 6 macro buttons:\n"
+            "- Each button can preset multiple fields at once (e.g. CODE=BONE, LEVEL=2B, PRISM=Mini, UNIT=N100E101) "
+            "and immediately trigger a measurement.\n"
+            "- Assign a single-key shortcut (e.g. '1' or 'B') to invoke the button via Ctrl+1 or Ctrl+B.\n"
+            "- Switching UNIT via a SpeedButton safely restores that unit's next ID without skipping numbers."
+        ),
+        "6. Context Defaults & 6-Way Coordinate Offsets": (
+            "CONTEXT-DEPENDENT DEFAULTS & POST-SHOT OFFSETS\n"
+            "==============================================\n"
+            "- Context-Dependent Defaults (Station & Edit -> Context Dependent Defaults): Link a Master Variable "
+            "(such as LEVEL) to one or more Dependent Variables (such as EXCAVATOR or CODE). Changing the Master "
+            "Variable on the main screen automatically fills in the associated Dependent Variable defaults.\n"
+            "- 6-Way Offset (Station & Edit -> Offset Last Point): Offset the last recorded point East, West, "
+            "North, South, Up, or Down (up to 1000m). Alerts you if the offset moves the point across an "
+            "excavation unit boundary."
+        ),
+        "7. Data Grid, Filtering & GIS Export": (
+            "DATA GRID, FILTERING & EXPORTING\n"
+            "================================\n"
+            "- Show Data Grid (Options -> Show Data Grid): Inspect all recorded shots, toggle visible columns "
+            "on the left checklist, or double-click any cell to edit coordinates or attributes inline.\n"
+            "- Set Grid Filter (Options -> Set Grid Filter): Filter the grid and plot canvas by any field and "
+            "distinct recorded value, or check 'Show only Points from Current Station'.\n"
+            "- Exporters (File Menu): Export the 4-table legacy EDMWin CSV bundle (_points, _datums, _prisms, _units) "
+            "or a 3D QGIS GeoJSON FeatureCollection (with automatic LineString reconstruction for +Shot series)."
+        ),
+        "8. Hardware Protocols, Debugging & Bag Labels": (
+            "TOTAL STATION PROTOCOLS, DEBUGGING & LABELS\n"
+            "===========================================\n"
+            "- Supported Instruments: Leica GeoCOM (Wild2), Leica Motorized AutoTilt, Leica/Wild GSI-8 & GSI-16, "
+            "Leica Builder, Topcon (with hex & 3-digit decimal BCC verification), Sokkia, Nikon, Microscribe, "
+            "Manual Entry, and Offline Simulator.\n"
+            "- Debug Total Station (Station & Edit -> Debug Total Station): Send preset GeoCOM commands, run "
+            "test X-Shots, or enable serial communication logging via 'Setup Log Files'.\n"
+            "- Artifact Bag Labels: Enable 'Options -> Print Shots (Artifact Bag Labels)' or open 'File -> "
+            "Print / Reprint Artifact Bag Labels' to preview and spool ASCII or Zebra ZPL II barcode labels."
+        ),
+    }
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("EDM Help Topics")
+        self.resize(820, 520)
+
+        root = QVBoxLayout(self)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search Help:"))
+        self.txt_search = QLineEdit()
+        self.txt_search.setPlaceholderText("Filter topics by keyword (e.g. Resection, Button, Offset, GeoCOM)...")
+        self.txt_search.textChanged.connect(self.filter_topics)
+        search_row.addWidget(self.txt_search, 1)
+        root.addLayout(search_row)
+
+        split = QHBoxLayout()
+        self.lst_topics = QListWidget()
+        self.lst_topics.setMaximumWidth(280)
+        self.lst_topics.currentTextChanged.connect(self._on_topic_selected)
+        split.addWidget(self.lst_topics)
+
+        self.txt_content = QPlainTextEdit()
+        self.txt_content.setReadOnly(True)
+        split.addWidget(self.txt_content, 1)
+        root.addLayout(split, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        root.addWidget(close_btn)
+
+        self.filter_topics("")
+
+    def filter_topics(self, query: str) -> None:
+        q = query.strip().upper()
+        self.lst_topics.clear()
+        for title, body in self.HELP_TOPICS.items():
+            if not q or q in title.upper() or q in body.upper():
+                self.lst_topics.addItem(title)
+        if self.lst_topics.count() > 0:
+            self.lst_topics.setCurrentRow(0)
+        else:
+            self.txt_content.setPlainText("No matching help topics found.")
+
+    def _on_topic_selected(self, topic_title: str) -> None:
+        body = self.HELP_TOPICS.get(topic_title, "")
+        self.txt_content.setPlainText(body)
+
+
+class LegacyMigrationDialog(QDialog):
+    """
+    Visual Migration Wizard for importing legacy EDMWin projects (.mdb or 4-file CSV bundles)
+    into the active Modern EDM SQLite database:
+    - Mode 1: 4-File CSV Bundle (<prefix>_points.csv, _datums.csv, _prisms.csv, _units.csv)
+    - Mode 2: Legacy Microsoft Access Database (.mdb / .accdb) with optional Points Table hint
+    - Displays detailed MigrationReport summary upon completion.
+    """
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        default_dir: Optional[Path] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Import Legacy EDMWin Project (.MDB / 4-File CSV Bundle)")
+        self.resize(640, 440)
+        self.db = db
+        self.default_dir = default_dir or Path.cwd()
+        self.last_report: Optional[Any] = None
+
+        root = QVBoxLayout(self)
+
+        info_lbl = QLabel(
+            "Import Datums, Prisms, Excavation Units, and Points from a legacy EDMWin "
+            "4-file CSV bundle (_points, _datums, _prisms, _units) or a Microsoft Access (.mdb) "
+            "database into the active SQLite project. Unit-scoped IDs and carryover states are "
+            "reconstructed automatically."
+        )
+        info_lbl.setWordWrap(True)
+        root.addWidget(info_lbl)
+
+        mode_box = QGroupBox("Migration Source Type")
+        mode_row = QHBoxLayout(mode_box)
+        self.mode_group = QButtonGroup(self)
+        self.rb_csv_bundle = QRadioButton("4-File CSV Bundle (_points, _datums, _prisms, _units)")
+        self.rb_mdb = QRadioButton("Microsoft Access Database (.mdb / .accdb)")
+        self.rb_csv_bundle.setChecked(True)
+        self.mode_group.addButton(self.rb_csv_bundle)
+        self.mode_group.addButton(self.rb_mdb)
+        mode_row.addWidget(self.rb_csv_bundle)
+        mode_row.addWidget(self.rb_mdb)
+        root.addWidget(mode_box)
+
+        form = QFormLayout()
+        src_row = QHBoxLayout()
+        self.txt_source = QLineEdit()
+        self.txt_source.setPlaceholderText("Select _points.csv file, bundle prefix, or .mdb file...")
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._on_browse)
+        src_row.addWidget(self.txt_source, 1)
+        src_row.addWidget(btn_browse)
+
+        self.txt_points_table = QLineEdit()
+        self.txt_points_table.setPlaceholderText("Optional: Points table name in .mdb (auto-detected if blank)")
+
+        form.addRow("Source Path / Prefix:", src_row)
+        form.addRow("MDB Points Table Hint:", self.txt_points_table)
+        root.addLayout(form)
+
+        log_box = QGroupBox("Migration Summary Log")
+        log_layout = QVBoxLayout(log_box)
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
+        log_layout.addWidget(self.txt_log, 1)
+        root.addWidget(log_box, 1)
+
+        btn_row = QHBoxLayout()
+        run_btn = QPushButton("Run Import")
+        run_btn.clicked.connect(self._on_run_import)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(run_btn)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    def _on_browse(self) -> None:
+        if self.rb_mdb.isChecked():
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Legacy EDMWin .MDB Database",
+                str(self.default_dir),
+                "Access Databases (*.mdb *.MDB *.accdb)",
+            )
+        else:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Any CSV File in the 4-Table Bundle (e.g. <prefix>_points.csv)",
+                str(self.default_dir),
+                "CSV Files (*.csv *.CSV)",
+            )
+        if path:
+            self.txt_source.setText(path)
+
+    def run_migration(self, source_path: Optional[str] = None, points_table_hint: str = "") -> Any:
+        from storage.legacy_migrator import import_edmwin_csv_bundle, import_edmwin_mdb
+
+        src = (source_path if source_path is not None else self.txt_source.text()).strip()
+        if not src:
+            raise ValueError("Please select a source CSV bundle or .mdb file to import.")
+
+        hint = (points_table_hint or self.txt_points_table.text()).strip()
+        p = Path(src)
+        if self.rb_mdb.isChecked() or p.suffix.lower() in (".mdb", ".accdb"):
+            rep = import_edmwin_mdb(self.db, p, points_table_hint=hint)
+        else:
+            rep = import_edmwin_csv_bundle(self.db, p)
+
+        self.last_report = rep
+        self.txt_log.setPlainText(rep.summary_text())
+        return rep
+
+    def _on_run_import(self) -> None:
+        try:
+            self.run_migration()
+        except Exception as exc:
+            QMessageBox.warning(self, "Migration Error", str(exc))
+
+
+class CloudAndEmailShareDialog(QDialog):
+    """
+    Unified Cloud Storage (Dropbox & Google Drive) and Email / Gmail Attachment Dialog:
+    - Tab 1: Dropbox (Export/Upload & Import/Download via Dropbox API v2 or Local Synced Folder)
+    - Tab 2: Google Drive (Export/Upload & Import/Download via Google Drive API v3 or Local Synced Folder)
+    - Tab 3: Email & Gmail Share (Attach 4-Table CSV Bundle .zip, Points .csv, GeoJSON, or Full Project .zip
+             via Gmail SMTP, Gmail REST API v1, or RFC-5322 .eml Desktop Mail Client Draft)
+    Supports 'SIMULATE' tokens/passwords out of the box so all cloud & email flows can be tested offline.
+    """
+
+    EXPORT_FORMATS = [
+        ("4-Table EDMWin CSV Bundle (.zip)", "CSV_BUNDLE"),
+        ("Single Points Table (.csv)", "POINTS_CSV"),
+        ("QGIS 3D Survey (.geojson)", "GEOJSON"),
+        ("Full Project Backup (.sqlite + CSVs + GeoJSON + .cfg .zip)", "PROJECT_ZIP"),
+    ]
+
+    def __init__(
+        self,
+        db: EDMDatabase,
+        cfg: EDMConfig,
+        cfg_path: Optional[Path] = None,
+        initial_tab: int = 0,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Cloud Sync (Dropbox / Google Drive) & Email / Gmail Share")
+        self.resize(740, 580)
+        self.db = db
+        self.cfg = cfg
+        self.cfg_path = cfg_path
+        self.work_dir = (cfg_path.parent if cfg_path else Path.cwd()) / "_cloud_staging"
+
+        root = QVBoxLayout(self)
+
+        # Shared Export Format selector at top
+        fmt_box = QGroupBox("Export / Attachment Package Format")
+        fmt_layout = QHBoxLayout(fmt_box)
+        fmt_layout.addWidget(QLabel("Package Format:"))
+        self.cbo_format = QComboBox()
+        for label, code in self.EXPORT_FORMATS:
+            self.cbo_format.addItem(label, code)
+        fmt_layout.addWidget(self.cbo_format, 1)
+        fmt_layout.addWidget(QLabel("Filename Prefix:"))
+        self.txt_prefix = QLineEdit(self.cfg.point_table or "excavation_export")
+        fmt_layout.addWidget(self.txt_prefix)
+        root.addWidget(fmt_box)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_dropbox_tab(), "1. Dropbox Sync")
+        self.tabs.addTab(self._build_gdrive_tab(), "2. Google Drive Sync")
+        self.tabs.addTab(self._build_email_tab(), "3. Email / Gmail Attachment")
+        self.tabs.setCurrentIndex(max(0, min(2, initial_tab)))
+        root.addWidget(self.tabs, 1)
+
+        log_box = QGroupBox("Transfer & Activity Log")
+        log_layout = QVBoxLayout(log_box)
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setMaximumHeight(130)
+        log_layout.addWidget(self.txt_log)
+        root.addWidget(log_box)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        root.addWidget(close_btn)
+
+    def selected_export_format(self) -> str:
+        return str(self.cbo_format.currentData() or "CSV_BUNDLE")
+
+    def _build_staged_artifact(self) -> Path:
+        from storage.cloud_sync import build_export_artifact
+
+        return build_export_artifact(
+            self.db,
+            output_dir=self.work_dir,
+            export_format=self.selected_export_format(),
+            prefix=self.txt_prefix.text().strip() or "excavation_export",
+            cfg_path=self.cfg_path,
+        )
+
+    # --- Tab 1: Dropbox ---
+    def _build_dropbox_tab(self) -> QWidget:
+        from storage.cloud_sync import DropboxClient
+
+        w = QWidget()
+        v = QVBoxLayout(w)
+        form = QFormLayout()
+
+        self.txt_dbx_token = QLineEdit(os.environ.get("DROPBOX_ACCESS_TOKEN", "SIMULATE"))
+        self.txt_dbx_token.setPlaceholderText("Dropbox OAuth2 Access Token (or 'SIMULATE' for offline test)")
+        self.txt_dbx_remote_path = QLineEdit("/ModernEDM/excavation_export.zip")
+
+        local_sync = DropboxClient.detect_local_sync_folder()
+        self.txt_dbx_local_folder = QLineEdit(str(local_sync) if local_sync else "")
+        self.txt_dbx_local_folder.setPlaceholderText("Optional local ~/Dropbox folder path")
+
+        form.addRow("Dropbox Access Token:", self.txt_dbx_token)
+        form.addRow("Remote Dropbox Path:", self.txt_dbx_remote_path)
+        form.addRow("Local Dropbox Folder:", self.txt_dbx_local_folder)
+        v.addLayout(form)
+
+        row = QHBoxLayout()
+        btn_up = QPushButton("Export && Upload to Dropbox API")
+        btn_up.clicked.connect(self.run_dropbox_upload)
+        btn_dn = QPushButton("Download && Import from Dropbox API")
+        btn_dn.clicked.connect(self.run_dropbox_download)
+        btn_local = QPushButton("Copy Export to Local Dropbox Folder")
+        btn_local.clicked.connect(self._on_copy_to_local_dropbox)
+        row.addWidget(btn_up)
+        row.addWidget(btn_dn)
+        row.addWidget(btn_local)
+        v.addLayout(row)
+        v.addStretch()
+        return w
+
+    def run_dropbox_upload(self) -> Any:
+        from storage.cloud_sync import DropboxClient
+
+        artifact = self._build_staged_artifact()
+        remote_p = self.txt_dbx_remote_path.text().strip() or f"/ModernEDM/{artifact.name}"
+        if not remote_p.endswith(artifact.suffix):
+            remote_p = f"{remote_p.rstrip('/')}/{artifact.name}"
+        client = DropboxClient(self.txt_dbx_token.text())
+        res = client.upload_file(artifact, remote_p)
+        self.txt_log.appendPlainText(res.message)
+        return res
+
+    def run_dropbox_download(self, simulated_bytes: Optional[bytes] = None) -> Dict[str, int]:
+        from storage.cloud_sync import DropboxClient, import_artifact_into_db
+
+        remote_p = self.txt_dbx_remote_path.text().strip() or "/ModernEDM/excavation_export.zip"
+        local_dst = self.work_dir / Path(remote_p).name
+        client = DropboxClient(self.txt_dbx_token.text())
+        res = client.download_file(remote_p, local_dst, simulated_source_bytes=simulated_bytes)
+        counts = import_artifact_into_db(self.db, local_dst, extract_dir=self.work_dir / "dbx_extract")
+        self.txt_log.appendPlainText(f"{res.message}\nImported into SQLite: {counts}")
+        return counts
+
+    def _on_copy_to_local_dropbox(self) -> None:
+        folder = self.txt_dbx_local_folder.text().strip()
+        if not folder:
+            path = QFileDialog.getExistingDirectory(self, "Select Local Dropbox Folder")
+            if not path:
+                return
+            folder = path
+            self.txt_dbx_local_folder.setText(folder)
+        artifact = self._build_staged_artifact()
+        dest = Path(folder) / artifact.name
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        shutil.copy2(artifact, dest)
+        self.txt_log.appendPlainText(f"Copied {artifact.name} to local Dropbox folder: {dest}")
+
+    # --- Tab 2: Google Drive ---
+    def _build_gdrive_tab(self) -> QWidget:
+        from storage.cloud_sync import GoogleDriveClient
+
+        w = QWidget()
+        v = QVBoxLayout(w)
+        form = QFormLayout()
+
+        self.txt_gdrive_token = QLineEdit(os.environ.get("GOOGLE_DRIVE_TOKEN", "SIMULATE"))
+        self.txt_gdrive_token.setPlaceholderText("Google OAuth2 Bearer Token (or 'SIMULATE' for offline test)")
+        self.txt_gdrive_folder_id = QLineEdit("")
+        self.txt_gdrive_folder_id.setPlaceholderText("Optional Drive Folder ID (leave blank for My Drive root)")
+        self.txt_gdrive_file_id = QLineEdit("gdrive_sim_excavation_export.zip")
+        self.txt_gdrive_file_id.setPlaceholderText("Google Drive File ID for Download/Import")
+
+        local_sync = GoogleDriveClient.detect_local_sync_folder()
+        self.txt_gdrive_local_folder = QLineEdit(str(local_sync) if local_sync else "")
+        self.txt_gdrive_local_folder.setPlaceholderText("Optional local Google Drive folder path")
+
+        form.addRow("Google OAuth2 Token:", self.txt_gdrive_token)
+        form.addRow("Target Drive Folder ID:", self.txt_gdrive_folder_id)
+        form.addRow("Drive File ID (for Import):", self.txt_gdrive_file_id)
+        form.addRow("Local Google Drive Folder:", self.txt_gdrive_local_folder)
+        v.addLayout(form)
+
+        row = QHBoxLayout()
+        btn_up = QPushButton("Export && Upload to Google Drive API")
+        btn_up.clicked.connect(self.run_gdrive_upload)
+        btn_dn = QPushButton("Download && Import from Google Drive API")
+        btn_dn.clicked.connect(self.run_gdrive_download)
+        btn_local = QPushButton("Copy Export to Local Google Drive")
+        btn_local.clicked.connect(self._on_copy_to_local_gdrive)
+        row.addWidget(btn_up)
+        row.addWidget(btn_dn)
+        row.addWidget(btn_local)
+        v.addLayout(row)
+        v.addStretch()
+        return w
+
+    def run_gdrive_upload(self) -> Any:
+        from storage.cloud_sync import GoogleDriveClient
+
+        artifact = self._build_staged_artifact()
+        client = GoogleDriveClient(self.txt_gdrive_token.text())
+        res = client.upload_file(
+            artifact,
+            drive_filename=artifact.name,
+            folder_id=self.txt_gdrive_folder_id.text(),
+        )
+        self.txt_gdrive_file_id.setText(res.remote_id_or_path)
+        self.txt_log.appendPlainText(res.message)
+        return res
+
+    def run_gdrive_download(self, simulated_bytes: Optional[bytes] = None) -> Dict[str, int]:
+        from storage.cloud_sync import GoogleDriveClient, import_artifact_into_db
+
+        fid = self.txt_gdrive_file_id.text().strip() or "gdrive_sim_excavation_export.zip"
+        ext = ".zip" if not fid.lower().endswith((".csv", ".zip", ".mdb")) else ""
+        local_dst = self.work_dir / f"{Path(fid).name}{ext}"
+        client = GoogleDriveClient(self.txt_gdrive_token.text())
+        res = client.download_file(fid, local_dst, simulated_source_bytes=simulated_bytes)
+        counts = import_artifact_into_db(self.db, local_dst, extract_dir=self.work_dir / "gdrive_extract")
+        self.txt_log.appendPlainText(f"{res.message}\nImported into SQLite: {counts}")
+        return counts
+
+    def _on_copy_to_local_gdrive(self) -> None:
+        folder = self.txt_gdrive_local_folder.text().strip()
+        if not folder:
+            path = QFileDialog.getExistingDirectory(self, "Select Local Google Drive Folder")
+            if not path:
+                return
+            folder = path
+            self.txt_gdrive_local_folder.setText(folder)
+        artifact = self._build_staged_artifact()
+        dest = Path(folder) / artifact.name
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        shutil.copy2(artifact, dest)
+        self.txt_log.appendPlainText(f"Copied {artifact.name} to local Google Drive folder: {dest}")
+
+    # --- Tab 3: Email & Gmail Attachment ---
+    def _build_email_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        form = QFormLayout()
+
+        self.txt_smtp_host = QLineEdit("smtp.gmail.com")
+        self.spn_smtp_port = QSpinBox()
+        self.spn_smtp_port.setRange(1, 65535)
+        self.spn_smtp_port.setValue(587)
+
+        self.txt_sender = QLineEdit(os.environ.get("EDM_SENDER_EMAIL", "excavation@gmail.com"))
+        self.txt_password = QLineEdit(os.environ.get("EDM_EMAIL_PASSWORD", "SIMULATE"))
+        self.txt_password.setEchoMode(QLineEdit.Password)
+        self.txt_password.setPlaceholderText("Gmail App Password, OAuth2 Token, or 'SIMULATE'")
+
+        self.txt_recipients = QLineEdit("lab-director@example.edu")
+        self.txt_subject = QLineEdit(f"Modern EDM Survey Export — {self.cfg.point_table or 'Site'}")
+        self.txt_body = QPlainTextEdit(
+            "Attached is the latest total-station excavation export from Modern EDM."
+        )
+        self.txt_body.setMaximumHeight(75)
+
+        host_row = QHBoxLayout()
+        host_row.addWidget(self.txt_smtp_host, 1)
+        host_row.addWidget(QLabel("Port:"))
+        host_row.addWidget(self.spn_smtp_port)
+
+        form.addRow("SMTP Server (Gmail default):", host_row)
+        form.addRow("From (Sender Email):", self.txt_sender)
+        form.addRow("App Password / OAuth Token:", self.txt_password)
+        form.addRow("To (Comma-separated):", self.txt_recipients)
+        form.addRow("Subject:", self.txt_subject)
+        form.addRow("Message Body:", self.txt_body)
+        v.addLayout(form)
+
+        row = QHBoxLayout()
+        btn_smtp = QPushButton("Send via Gmail / SMTP")
+        btn_smtp.clicked.connect(self.run_send_smtp)
+        btn_gmail_api = QPushButton("Send via Gmail REST API")
+        btn_gmail_api.clicked.connect(self.run_send_gmail_api)
+        btn_eml = QPushButton("Save .EML Draft (Open in Mail App)")
+        btn_eml.clicked.connect(self.run_save_eml_draft)
+        row.addWidget(btn_smtp)
+        row.addWidget(btn_gmail_api)
+        row.addWidget(btn_eml)
+        v.addLayout(row)
+        return w
+
+    def run_send_smtp(self) -> Any:
+        from storage.cloud_sync import EmailShareClient
+
+        artifact = self._build_staged_artifact()
+        res = EmailShareClient.send_via_smtp(
+            smtp_host=self.txt_smtp_host.text(),
+            smtp_port=int(self.spn_smtp_port.value()),
+            sender_email=self.txt_sender.text(),
+            password_or_app_password=self.txt_password.text(),
+            recipient_emails=self.txt_recipients.text(),
+            subject=self.txt_subject.text(),
+            body_text=self.txt_body.toPlainText(),
+            attachment_paths=[artifact],
+        )
+        self.txt_log.appendPlainText(res.message)
+        return res
+
+    def run_send_gmail_api(self) -> Any:
+        from storage.cloud_sync import EmailShareClient
+
+        artifact = self._build_staged_artifact()
+        res = EmailShareClient.send_via_gmail_api(
+            oauth_access_token=self.txt_password.text(),
+            sender_email=self.txt_sender.text(),
+            recipient_emails=self.txt_recipients.text(),
+            subject=self.txt_subject.text(),
+            body_text=self.txt_body.toPlainText(),
+            attachment_paths=[artifact],
+        )
+        self.txt_log.appendPlainText(res.message)
+        return res
+
+    def run_save_eml_draft(self, dest_eml_path: Optional[Path] = None) -> Any:
+        from storage.cloud_sync import EmailShareClient
+
+        artifact = self._build_staged_artifact()
+        eml_path = dest_eml_path or (self.work_dir / f"{artifact.stem}.eml")
+        res = EmailShareClient.save_eml_draft(
+            eml_dest_path=eml_path,
+            sender_email=self.txt_sender.text(),
+            recipient_emails=self.txt_recipients.text(),
+            subject=self.txt_subject.text(),
+            body_text=self.txt_body.toPlainText(),
+            attachment_paths=[artifact],
+        )
+        self.txt_log.appendPlainText(res.message)
+        return res
 
 

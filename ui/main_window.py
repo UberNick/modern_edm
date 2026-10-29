@@ -61,6 +61,7 @@ from survey.math_engine import (
 from ui.dialogs import (
     AboutDialog,
     CFGFieldEditorDialog,
+    CloudAndEmailShareDialog,
     ContextDefaultsDialog,
     CreateDefaultProjectDialog,
     DataGridDialog,
@@ -69,6 +70,9 @@ from ui.dialogs import (
     EDMStatusDialog,
     EntityManagerDialog,
     FieldFilterDialog,
+    HelpViewerDialog,
+    LabelPrinterDialog,
+    LegacyMigrationDialog,
     ManualShotDialog,
     OffsetPointDialog,
     SerialTerminalDialog,
@@ -169,8 +173,29 @@ class EDMMainWindow(QMainWindow):
         imp_csv_act.triggered.connect(self._on_import_csv)
         exp_geo_act = QAction("Export QGIS GeoJSON (Points + Lines)...", self)
         exp_geo_act.triggered.connect(self._on_export_geojson)
+        imp_legacy_act = QAction("&Import Legacy EDMWin Project (.MDB / 4-File CSV Bundle)...", self)
+        imp_legacy_act.triggered.connect(self._open_legacy_migration)
+        cloud_dbx_act = QAction("Cloud Sync: &Dropbox (Import / Export)...", self)
+        cloud_dbx_act.triggered.connect(lambda: self._open_cloud_and_email_share(0))
+        cloud_gdrive_act = QAction("Cloud Sync: &Google Drive (Import / Export)...", self)
+        cloud_gdrive_act.triggered.connect(lambda: self._open_cloud_and_email_share(1))
+        email_share_act = QAction("Share Export via &Email / Gmail Attachment...", self)
+        email_share_act.triggered.connect(lambda: self._open_cloud_and_email_share(2))
+        print_lbl_dlg_act = QAction("&Print / Reprint Artifact Bag Labels...", self)
+        print_lbl_dlg_act.triggered.connect(self._open_label_printer)
         file_menu.addActions([
-            create_def_act, load_cfg_act, save_cfg_act, exp_bundle_act, exp_csv_act, imp_csv_act, exp_geo_act
+            create_def_act,
+            load_cfg_act,
+            save_cfg_act,
+            imp_legacy_act,
+            cloud_dbx_act,
+            cloud_gdrive_act,
+            email_share_act,
+            print_lbl_dlg_act,
+            exp_bundle_act,
+            exp_csv_act,
+            imp_csv_act,
+            exp_geo_act,
         ])
 
         setup_menu = menubar.addMenu("&Station && Edit")
@@ -259,11 +284,14 @@ class EDMMainWindow(QMainWindow):
         ])
 
         help_menu = menubar.addMenu("&Help")
+        help_topics_act = QAction("&Help Topics [F1]...", self)
+        help_topics_act.setShortcut("F1")
+        help_topics_act.triggered.connect(self._open_help_dialog)
         status_act = QAction("&Status...", self)
         status_act.triggered.connect(self._open_status_dialog)
         about_act = QAction("&About...", self)
         about_act.triggered.connect(self._open_about_dialog)
-        help_menu.addActions([status_act, about_act])
+        help_menu.addActions([help_topics_act, status_act, about_act])
 
     def _on_toggle_options(self) -> None:
         self.cfg.auto_find_unit = self.auto_find_act.isChecked()
@@ -998,6 +1026,38 @@ class EDMMainWindow(QMainWindow):
     def _open_about_dialog(self) -> None:
         """Opens About EDM (frmAbout replica)."""
         dlg = AboutDialog(self)
+        dlg.exec()
+
+    def _open_label_printer(self) -> None:
+        """Opens the Artifact Bag Label Printer & Reprint dialog."""
+        dlg = LabelPrinterDialog(self.db, self.cfg, self.label_spool_path, self)
+        dlg.exec()
+        self.label_spool_path = dlg.spool_path
+
+    def _open_legacy_migration(self) -> None:
+        """Opens the Legacy EDMWin (.MDB / 4-File CSV Bundle) migration dialog."""
+        dlg = LegacyMigrationDialog(self.db, default_dir=self.cfg_path.parent, parent=self)
+        dlg.exec()
+        if dlg.last_report is not None:
+            self._rebuild_cfg_form()
+            self._refresh_all()
+
+    def _open_cloud_and_email_share(self, initial_tab: int = 0) -> None:
+        """Opens the Dropbox / Google Drive Sync & Email / Gmail Attachment Share dialog."""
+        dlg = CloudAndEmailShareDialog(
+            self.db,
+            self.cfg,
+            cfg_path=self.cfg_path,
+            initial_tab=initial_tab,
+            parent=self,
+        )
+        dlg.exec()
+        self._rebuild_cfg_form()
+        self._refresh_all()
+
+    def _open_help_dialog(self) -> None:
+        """Opens the in-app Help Topics viewer (frmHelp replica)."""
+        dlg = HelpViewerDialog(self)
         dlg.exec()
 
     def _on_master_field_changed(self, field_name: str, new_value: str) -> None:

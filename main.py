@@ -94,14 +94,8 @@ def main() -> int:
     window.show()
 
     if args.headless_check:
-        import gc
         app.processEvents()
-        window.close()
-        window.deleteLater()
         window.db.close()
-        app.closeAllWindows()
-        app.processEvents()
-        gc.collect()
         os._exit(0)
 
     return app.exec()

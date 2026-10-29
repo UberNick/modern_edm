@@ -21,8 +21,13 @@ from drivers.total_station import (
     SerialConfig,
     SokkiaNikonDriver,
     TopconDriver,
+    TrimbleM3Driver,
+    ZeissRec500Driver,
     compute_topcon_bcc,
     compute_topcon_bcc_decimal3,
+    create_driver,
+    discover_bluetooth_devices,
+    parse_transport_endpoint,
     radians_to_dddmmss,
 )
 from storage.cfg_parser import (
@@ -861,6 +866,400 @@ def test_setup_log_files_and_create_default_project_dialogs_offscreen(tmp_path: 
     app.processEvents()
 
 
+def test_label_printer_and_help_viewer_dialogs_offscreen(tmp_path: Path) -> None:
+    """
+    Tests LabelPrinterDialog (Artifact Bag Label preview/reprint) and HelpViewerDialog (frmHelp replica):
+    - Previewing ASCII and ZPL II labels for recorded shots
+    - Reprinting multiple copies to a spool file and clearing the spool file
+    - Searching and browsing topics in HelpViewerDialog
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from ui.dialogs import HelpViewerDialog, LabelPrinterDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg_file = Path(__file__).resolve().parent.parent / "sample_excavation.cfg"
+    cfg = load_cfg_file(cfg_file)
+    db = EDMDatabase(tmp_path / "label_help_test.sqlite")
+
+    stn = db.load_station_state()
+    prism = Prism("Mini", 0.10, 0.017)
+    db.record_point(
+        "N100E100", "25", 0, 100.5, 100.6, 9.75, prism, 1.5, 45.0, 90.0, stn,
+        {"CODE": "LITHIC", "LEVEL": "2A", "EXCAVATOR": "HD"},
+    )
+
+    spool_file = tmp_path / "reprint_spool.txt"
+    lbl_dlg = LabelPrinterDialog(db, cfg, spool_file)
+    assert "*N100E100-25-0*" in lbl_dlg.render_current_label()
+
+    lbl_dlg.rb_zpl.setChecked(True)
+    assert "^B3N" in lbl_dlg.render_current_label()
+
+    lbl_dlg.spn_copies.setValue(2)
+    lbl_dlg.reprint_selected_shot()
+    spool_content = spool_file.read_text(encoding="utf-8")
+    assert spool_content.count("^XA") == 2
+
+    lbl_dlg.clear_spool_file()
+    assert spool_file.read_text(encoding="utf-8") == ""
+    lbl_dlg.close()
+    lbl_dlg.deleteLater()
+
+    # 2. Test HelpViewerDialog (frmHelp)
+    help_dlg = HelpViewerDialog()
+    assert help_dlg.lst_topics.count() == len(HelpViewerDialog.HELP_TOPICS)
+    help_dlg.filter_topics("Resection")
+    assert help_dlg.lst_topics.count() >= 1
+    assert "Resection" in help_dlg.txt_content.toPlainText()
+    help_dlg.filter_topics("NON_EXISTENT_KEYWORD_XYZ")
+    assert help_dlg.lst_topics.count() == 0
+    help_dlg.close()
+    help_dlg.deleteLater()
+
+    db.close()
+    app.processEvents()
+
+
+def test_legacy_csv_bundle_and_mdb_migration_offscreen(tmp_path: Path) -> None:
+    """
+    Tests storage.legacy_migrator and LegacyMigrationDialog:
+    - Exporting a 4-table CSV bundle from a populated database and importing it into a fresh SQLite DB
+    - Reconstructing unit-scoped field state (ID = max_numeric_id + 1, LEVEL, CODE, EXCAVATOR)
+    - Importing legacy EDMWin .mdb table structures (EDM_Datums, EDM_Poles, EDM_Units, Points)
+      via custom_reader and LegacyMigrationDialog
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from storage.legacy_migrator import import_edmwin_mdb
+    from ui.dialogs import LegacyMigrationDialog
+
+    app = QApplication.instance() or QApplication([])
+
+    # 1. Create source DB, record shots across two units, and export 4-table CSV bundle
+    src_db = EDMDatabase(tmp_path / "mig_src.sqlite")
+    src_db.upsert_datum(Datum("D_MIG", 500.0, 600.0, 25.0, "Migration Datum"))
+    src_db.upsert_prism(Prism("MigPrism", 1.25, -0.015, "Migration Pole"))
+    src_db.upsert_unit(
+        ExcavationUnit("U_ALPHA", shape="RECT", min_x=500.0, min_y=600.0, max_x=502.0, max_y=602.0)
+    )
+    stn = src_db.load_station_state()
+    prism = Prism("MigPrism", 1.25, -0.015)
+    src_db.record_point(
+        "U_ALPHA", "7", 0, 500.5, 600.5, 24.8, prism, 2.0, 45.0, 90.0, stn,
+        {"CODE": "BONE", "LEVEL": "3A", "EXCAVATOR": "SPM"},
+    )
+    src_db.record_point(
+        "U_ALPHA", "12", 0, 500.8, 600.9, 24.7, prism, 2.1, 48.0, 90.0, stn,
+        {"CODE": "LITHIC", "LEVEL": "3B", "EXCAVATOR": "HD"},
+    )
+    bundle_paths = src_db.export_edmwin_csv_bundle(tmp_path / "site_export")
+    src_db.close()
+
+    # 2. Import 4-table CSV bundle into a fresh target DB via LegacyMigrationDialog
+    dst_db = EDMDatabase(tmp_path / "mig_dst_csv.sqlite")
+    mig_dlg = LegacyMigrationDialog(dst_db, default_dir=tmp_path)
+    rep_csv = mig_dlg.run_migration(source_path=bundle_paths["points"])
+    assert rep_csv.points_imported == 2
+    assert rep_csv.datums_imported >= 4
+    assert rep_csv.prisms_imported >= 4
+    assert rep_csv.units_imported >= 2
+
+    # Verify unit-scoped carryover state was reconstructed (max ID was 12 -> next ID is 13!)
+    rebuilt_state = dst_db.load_unit_field_state("U_ALPHA")
+    assert rebuilt_state["ID"] == "13"
+    assert rebuilt_state["LEVEL"] == "3B"
+    assert rebuilt_state["CODE"] == "LITHIC"
+    mig_dlg.close()
+    mig_dlg.deleteLater()
+    dst_db.close()
+
+    # 3. Test legacy .mdb table dictionary migration (EDM_Datums, EDM_Poles, EDM_Units, Context/Points)
+    fake_mdb_file = tmp_path / "LegacyPaleo.mdb"
+    fake_mdb_file.write_bytes(b"Standard Jet DB mock")
+
+    mock_mdb_tables = {
+        "EDM_Datums": [
+            {"Name": "MAIN_NAIL", "X": "1000.0", "Y": "2000.0", "Z": "50.0", "Description": "Cave Mouth"},
+        ],
+        "EDM_Poles": [
+            {"Name": "ShortPin", "Height": "0.05", "Offset": "0.0", "Description": "5cm Pin"},
+        ],
+        "EDM_Units": [
+            {"Unit": "SQ_J14", "X1": "1000.0", "X2": "1001.0", "Y1": "2000.0", "Y2": "2001.0", "LEVEL": "IV", "EXCAVATOR": "JD"},
+        ],
+        "Pech_Points": [
+            {
+                "UNIT": "SQ_J14", "ID": "99", "SUFFIX": "0",
+                "X": "1000.25", "Y": "2000.75", "Z": "49.10",
+                "PRISM": "ShortPin", "POLEHEIGHT": "0.05",
+                "SLOPED": "4.50", "HANGLE": "120.3000", "VANGLE": "92.1500",
+                "DATUMNAME": "MAIN_NAIL", "DATUMX": "1000.0", "DATUMY": "2000.0", "DATUMZ": "51.5",
+                "CODE": "SCRAPER", "LEVEL": "IV", "EXCAVATOR": "JD",
+            },
+        ],
+    }
+
+    mdb_dst_db = EDMDatabase(tmp_path / "mig_dst_mdb.sqlite")
+    rep_mdb = import_edmwin_mdb(
+        mdb_dst_db,
+        fake_mdb_file,
+        points_table_hint="Pech_Points",
+        custom_reader=lambda _p: mock_mdb_tables,
+    )
+    assert rep_mdb.datums_imported == 1
+    assert rep_mdb.prisms_imported == 1
+    assert rep_mdb.units_imported == 1
+    assert rep_mdb.points_imported == 1
+
+    pts_mdb = mdb_dst_db.list_points()
+    assert len(pts_mdb) == 1
+    assert pts_mdb[0]["unit"] == "SQ_J14"
+    assert pts_mdb[0]["id"] == "99"
+    assert pts_mdb[0]["extra_fields"]["CODE"] == "SCRAPER"
+
+    j14_state = mdb_dst_db.load_unit_field_state("SQ_J14")
+    assert j14_state["ID"] == "100"  # 99 + 1
+    assert j14_state["LEVEL"] == "IV"
+    assert j14_state["EXCAVATOR"] == "JD"
+
+    mdb_dst_db.close()
+    app.processEvents()
+
+
+def test_cloud_sync_and_email_share_offscreen(tmp_path: Path) -> None:
+    """
+    Tests storage.cloud_sync and CloudAndEmailShareDialog:
+    - Building all 4 export package formats (CSV_BUNDLE, POINTS_CSV, GEOJSON, PROJECT_ZIP)
+    - DropboxClient & GoogleDriveClient upload/download in both simulated and mock-HTTP modes
+    - EmailShareClient MIME builder, .eml draft generation, SMTP simulated send, and Gmail API send
+    - End-to-end CloudAndEmailShareDialog UI workflow (Dropbox upload/download -> SQLite import,
+      Google Drive upload/download -> SQLite import, and Email/Gmail sharing)
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import io
+    import json
+    from PySide6.QtWidgets import QApplication
+    from storage.cloud_sync import (
+        DropboxClient,
+        EmailShareClient,
+        GoogleDriveClient,
+        build_export_artifact,
+    )
+    from ui.dialogs import CloudAndEmailShareDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg_file = Path(__file__).resolve().parent.parent / "sample_excavation.cfg"
+    cfg = load_cfg_file(cfg_file)
+
+    # 1. Create a source database with recorded points
+    src_db = EDMDatabase(tmp_path / "cloud_src.sqlite")
+    stn = src_db.load_station_state()
+    prism = Prism("Mini", 0.10, 0.017)
+    src_db.record_point(
+        "N100E100", "55", 0, 100.25, 100.75, 9.80, prism, 1.5, 45.0, 90.0, stn,
+        {"CODE": "LITHIC", "LEVEL": "2A", "EXCAVATOR": "HD"},
+    )
+
+    # Verify all 4 export artifact builders
+    for fmt_code, expected_ext in [
+        ("CSV_BUNDLE", ".zip"),
+        ("POINTS_CSV", ".csv"),
+        ("GEOJSON", ".geojson"),
+        ("PROJECT_ZIP", ".zip"),
+    ]:
+        art = build_export_artifact(
+            src_db,
+            output_dir=tmp_path / "artifacts",
+            export_format=fmt_code,
+            prefix="site2026",
+            cfg_path=cfg_file,
+        )
+        assert art.is_file() and art.suffix == expected_ext
+
+    bundle_zip = build_export_artifact(
+        src_db, output_dir=tmp_path / "artifacts", export_format="CSV_BUNDLE", prefix="site2026"
+    )
+    bundle_bytes = bundle_zip.read_bytes()
+
+    # 2. Test DropboxClient & GoogleDriveClient with mock HTTP opener (non-simulated REST path)
+    class _MockHTTPResponse:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+        def read(self) -> bytes:
+            return self._payload
+        def __enter__(self) -> "_MockHTTPResponse":
+            return self
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    dbx_live = DropboxClient(
+        access_token="sl.REAL_TOKEN_TEST",
+        urlopen_fn=lambda req, timeout=30: _MockHTTPResponse(
+            json.dumps({"path_display": "/ModernEDM/site2026.zip"}).encode("utf-8")
+            if b"overwrite" in req.headers.get("Dropbox-api-arg", "").encode("utf-8")
+            or "overwrite" in req.headers.get("Dropbox-api-arg", "")
+            else bundle_bytes
+        ),
+    )
+    up_dbx = dbx_live.upload_file(bundle_zip, "/ModernEDM/site2026.zip")
+    assert up_dbx.simulated is False
+    assert up_dbx.remote_id_or_path == "/ModernEDM/site2026.zip"
+
+    gdrive_live = GoogleDriveClient(
+        access_token="ya29.REAL_GOOGLE_TOKEN",
+        urlopen_fn=lambda req, timeout=30: _MockHTTPResponse(
+            json.dumps({"id": "1AbCdEfGhIjKlMnOp"}).encode("utf-8")
+            if req.get_method() == "POST"
+            else bundle_bytes
+        ),
+    )
+    up_gd = gdrive_live.upload_file(bundle_zip, drive_filename="site2026.zip", folder_id="rootFolder123")
+    assert up_gd.simulated is False
+    assert up_gd.remote_id_or_path == "1AbCdEfGhIjKlMnOp"
+
+    # 3. Test CloudAndEmailShareDialog offscreen (Dropbox, Google Drive, and Email/Gmail tabs)
+    dst_db = EDMDatabase(tmp_path / "cloud_dst.sqlite")
+    dlg = CloudAndEmailShareDialog(dst_db, cfg, cfg_path=cfg_file, initial_tab=0)
+
+    # Tab 1: Dropbox upload + download & import into dst_db
+    res_dbx_up = dlg.run_dropbox_upload()
+    assert res_dbx_up.provider == "DROPBOX"
+    counts_dbx = dlg.run_dropbox_download(simulated_bytes=bundle_bytes)
+    assert counts_dbx["points"] == 1
+    assert dst_db.load_unit_field_state("N100E100")["ID"] == "56"
+
+    # Tab 2: Google Drive upload + download & import
+    res_gd_up = dlg.run_gdrive_upload()
+    assert res_gd_up.provider == "GOOGLE_DRIVE"
+    counts_gd = dlg.run_gdrive_download(simulated_bytes=bundle_bytes)
+    assert counts_gd["points"] == 1
+
+    # Tab 3: Email & Gmail Attachment Share (.eml draft, SMTP, and Gmail API)
+    eml_out = tmp_path / "export_draft.eml"
+    res_eml = dlg.run_save_eml_draft(dest_eml_path=eml_out)
+    assert eml_out.is_file()
+    eml_text = eml_out.read_text(encoding="utf-8", errors="replace")
+    assert "Content-Disposition: attachment" in eml_text
+    assert "_edmwin_bundle.zip" in eml_text
+
+    res_smtp = dlg.run_send_smtp()
+    assert res_smtp.provider == "EMAIL_SMTP"
+    assert res_smtp.bytes_transferred > 0
+
+    res_gmail = dlg.run_send_gmail_api()
+    assert res_gmail.provider == "GMAIL_API"
+    assert res_gmail.bytes_transferred > 0
+
+    # Also test Gmail REST API with mock HTTP opener
+    res_gmail_live = EmailShareClient.send_via_gmail_api(
+        oauth_access_token="ya29.LIVE_GMAIL_TOKEN",
+        sender_email="excavation@gmail.com",
+        recipient_emails="colleague@example.edu",
+        subject="Site Export",
+        body_text="Here is the data.",
+        attachment_paths=[bundle_zip],
+        urlopen_fn=lambda req, timeout=30: _MockHTTPResponse(b'{"id": "msg_98765"}'),
+    )
+    assert res_gmail_live.simulated is False
+    assert "msg_98765" in res_gmail_live.remote_id_or_path
+
+    dlg.close()
+    dlg.deleteLater()
+    src_db.close()
+    dst_db.close()
+    app.processEvents()
+
+
+def test_bluetooth_tcp_udp_and_multi_protocol_emulators() -> None:
+    """
+    Tests:
+    - Transport endpoint URI parsing (Bluetooth RFCOMM 'bt://', BLE 'ble://', Wi-Fi TCP 'tcp://', UDP 'udp://', Virtual, Serial)
+    - Bluetooth discovery (discover_bluetooth_devices)
+    - TrimbleM3Driver (Geodimeter GDS label 37/38/39 parser) & ZeissRec500Driver
+    - Virtual Hardware Emulation across ALL 10 driver protocols over virtual & simulated Bluetooth ports
+    - Live TCP/IP socket server -> TotalStationDriver client round-trip over 'tcp://127.0.0.1:<port>'
+    """
+    import socket
+    import threading
+
+    # 1. Verify URI transport endpoint parser
+    bt_ep = parse_transport_endpoint("bt://00:11:22:33:44:55:2")
+    assert bt_ep == {"scheme": "BT_RFCOMM", "address": "00:11:22:33:44:55", "channel": 2}
+    ble_ep = parse_transport_endpoint("ble://AA:BB:CC:DD:EE:FF")
+    assert ble_ep == {"scheme": "BLE_UART", "address": "AA:BB:CC:DD:EE:FF"}
+    tcp_ep = parse_transport_endpoint("tcp://192.168.1.50:5000")
+    assert tcp_ep == {"scheme": "TCP", "host": "192.168.1.50", "port": 5000}
+    udp_ep = parse_transport_endpoint("udp://127.0.0.1:9001")
+    assert udp_ep == {"scheme": "UDP", "host": "127.0.0.1", "port": 9001}
+    virt_ep = parse_transport_endpoint("BT-SIM-LEICA")
+    assert virt_ep["scheme"] == "VIRTUAL"
+
+    # 2. Verify Bluetooth discovery returns simulated/paired Bluetooth endpoints
+    bt_list = discover_bluetooth_devices()
+    assert any(dev_id == "BT-SIM-LEICA" for dev_id, _ in bt_list)
+
+    # 3. Verify Trimble M3 / Geodimeter GDS & Zeiss REC-500 parsers
+    trim_drv = TrimbleM3Driver(SerialConfig(port="VIRT-TRIMBLE"))
+    trim_obs = trim_drv.parse_response("37=90.3000\r\n38=90.0000\r\n39=14.2500\r\n")
+    assert math.isclose(trim_obs.slope_distance, 14.2500, abs_tol=1e-6)
+    assert math.isclose(trim_obs.horizontal_angle_deg, 90.5, abs_tol=1e-4)
+    assert trim_drv.format_set_horizontal_angle_cmd(45.1500) == "21=45.1500\r\n"
+
+    zeiss_drv = ZeissRec500Driver(SerialConfig(port="SIMULATOR"))
+    zeiss_obs = zeiss_drv.parse_response("0001  SD  18.5000  Hz  180.0000  V  90.0000\r\n")
+    assert math.isclose(zeiss_obs.slope_distance, 18.5000, abs_tol=1e-6)
+    assert math.isclose(zeiss_obs.horizontal_angle_deg, 180.0, abs_tol=1e-4)
+
+    # 4. Run end-to-end virtual measurement across ALL 10 instrument drivers over virtual/Bluetooth ports
+    for proto_name, port_name in [
+        ("LeicaGeoCOM", "BT-SIM-LEICA"),
+        ("Leica_AutoTilt", "VIRT-LEICA"),
+        ("LeicaGSI", "VIRT-LEICA"),
+        ("Builder", "VIRT-LEICA"),
+        ("Topcon", "BT-SIM-TOPCON"),
+        ("Sokkia", "BT-SIM-SOKKIA"),
+        ("Nikon", "VIRT-SOKKIA"),
+        ("Trimble", "VIRT-TRIMBLE"),
+        ("Zeiss", "TCP-SIM-STATION"),
+        ("Microscribe", "VIRT-MICROSCRIBE"),
+    ]:
+        drv = create_driver(proto_name, SerialConfig(port=port_name, edm_delay_time=0.0, verify_bcc=True))
+        drv.connect()
+        assert drv.is_connected is True
+        obs = drv.measure()
+        assert obs.slope_distance > 0.0
+        drv.disconnect()
+
+    # 5. Live localhost TCP/IP socket server -> LeicaGeoCOMDriver over 'tcp://127.0.0.1:<port>'
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    tcp_port = srv.getsockname()[1]
+
+    def _mock_station_server() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            conn.settimeout(2.0)
+            # First command: %R1Q,2008:1,1
+            _ = conn.recv(1024)
+            conn.sendall(b"%R1P,0,0:0\r\n")
+            # Second command: %R1Q,2108:10000,1
+            _ = conn.recv(1024)
+            conn.sendall(f"%R1P,0,0:0,{math.pi / 2:.8f},{math.pi / 2:.8f},22.5000\r\n".encode("ascii"))
+        srv.close()
+
+    t = threading.Thread(target=_mock_station_server, daemon=True)
+    t.start()
+
+    tcp_drv = create_driver("LeicaGeoCOM", SerialConfig(port=f"tcp://127.0.0.1:{tcp_port}", timeout=3.0))
+    obs_tcp = tcp_drv.measure()
+    assert math.isclose(obs_tcp.slope_distance, 22.5000, abs_tol=1e-6)
+    assert math.isclose(obs_tcp.horizontal_angle_deg, 90.0, abs_tol=1e-4)
+    tcp_drv.disconnect()
+    t.join(timeout=2.0)
+
+
 def test_unit_scoped_fields_and_csv_bundle_and_labels(tmp_path: Path) -> None:
     db = EDMDatabase(tmp_path / "bundle.sqlite")
     db.save_unit_field_state("N100E100", {"ID": "42", "LEVEL": "2B"})
@@ -903,13 +1302,20 @@ def test_unit_scoped_fields_and_csv_bundle_and_labels(tmp_path: Path) -> None:
 
 class TestEDMUnittestWrapper(unittest.TestCase):
     def test_all_protocols_and_math_and_ui_parity(self) -> None:
+        import gc
+        import shutil
+        from PySide6.QtWidgets import QApplication
+
         test_leica_geocom_and_autotilt_and_builder()
         test_leica_gsi8_and_gsi16_parser()
         test_topcon_bcc_and_sokkia_nikon_and_microscribe()
+        test_bluetooth_tcp_udp_and_multi_protocol_emulators()
         test_decompiled_math_and_prism_bounds_and_legacy_station_z()
         test_polar_to_cartesian_and_initializations()
         test_resection_two_and_three_point_exact_recovery()
-        with tempfile.TemporaryDirectory() as tmp:
+
+        tmp = tempfile.mkdtemp(prefix="modern_edm_test_")
+        try:
             tmp_p = Path(tmp)
             test_button_macros_and_duplicate_id_and_series_resequencing(tmp_p)
             test_unit_scoped_fields_and_csv_bundle_and_labels(tmp_p)
@@ -919,13 +1325,16 @@ class TestEDMUnittestWrapper(unittest.TestCase):
             test_context_defaults_and_manual_shot_dialogs_offscreen(tmp_p)
             test_status_debug_and_about_dialogs_offscreen(tmp_p)
             test_setup_log_files_and_create_default_project_dialogs_offscreen(tmp_p)
-        import gc
-        from PySide6.QtWidgets import QApplication
-        app = QApplication.instance()
-        if app is not None:
-            app.closeAllWindows()
-            app.processEvents()
-        gc.collect()
+            test_label_printer_and_help_viewer_dialogs_offscreen(tmp_p)
+            test_legacy_csv_bundle_and_mdb_migration_offscreen(tmp_p)
+            test_cloud_sync_and_email_share_offscreen(tmp_p)
+        finally:
+            app = QApplication.instance()
+            if app is not None:
+                app.closeAllWindows()
+                app.processEvents()
+            gc.collect()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

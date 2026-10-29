@@ -59,6 +59,11 @@ def format_zpl_barcode_label(point_record: Dict[str, Any], site_name: str = "EXC
     )
 
 
+def format_zpl_bag_label(point_record: Dict[str, Any], site_name: str = "EXCAVATION") -> str:
+    """Alias for format_zpl_barcode_label."""
+    return format_zpl_barcode_label(point_record, site_name)
+
+
 def append_label_to_spool(
     point_record: Dict[str, Any],
     spool_file: str | Path,

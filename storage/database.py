@@ -130,6 +130,7 @@ class EDMDatabase:
             );
             """
         )
+        cur.close()
         self.conn.commit()
 
         if not self.list_datums():
@@ -153,7 +154,17 @@ class EDMDatabase:
             )
 
     def close(self) -> None:
-        self.conn.close()
+        try:
+            self.conn.commit()
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            self.conn.execute("PRAGMA journal_mode=DELETE;")
+            self.conn.commit()
+        except Exception:
+            pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
     def upsert_datum(self, datum: Datum) -> None:
         with self.conn:
@@ -934,6 +945,36 @@ class EDMDatabase:
             "datums": str(dat_path),
             "prisms": str(prs_path),
             "units": str(unt_path),
+        }
+
+    def import_edmwin_csv_bundle(self, path_or_prefix: str | Path) -> Dict[str, int]:
+        """
+        Imports an EDMWin 4-table CSV bundle (_points.csv, _datums.csv, _prisms.csv, _units.csv)
+        and rebuilds unit-scoped field state.
+        """
+        from storage.legacy_migrator import import_edmwin_csv_bundle as _imp_bundle
+        rep = _imp_bundle(self, path_or_prefix)
+        return {
+            "points": rep.points_imported,
+            "datums": rep.datums_imported,
+            "prisms": rep.prisms_imported,
+            "units": rep.units_imported,
+            "unit_states": rep.units_state_rebuilt,
+        }
+
+    def import_edmwin_mdb(self, mdb_path: str | Path, points_table_hint: str = "") -> Dict[str, int]:
+        """
+        Imports all Datums, Prisms, Units, and Points from a legacy EDMWin Microsoft Access (.mdb)
+        file into this SQLite database and rebuilds unit-scoped field state.
+        """
+        from storage.legacy_migrator import import_edmwin_mdb as _imp_mdb
+        rep = _imp_mdb(self, mdb_path, points_table_hint=points_table_hint)
+        return {
+            "points": rep.points_imported,
+            "datums": rep.datums_imported,
+            "prisms": rep.prisms_imported,
+            "units": rep.units_imported,
+            "unit_states": rep.units_state_rebuilt,
         }
 
     # --- Context-Dependent Defaults (EDM_Defaults / frmSubUnits Parity) ---

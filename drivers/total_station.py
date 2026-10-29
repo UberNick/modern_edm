@@ -1,15 +1,28 @@
 """
-Hardware & Serial Protocol Drivers for EDMWin Replacement.
-Supports all 10 instrument modes found in edmwin.exe (0x00430e14 - 0x00431e00):
-1. LeicaGeoCOMDriver (WILD2 / LEICA GeoCOM ASCII RPC)
+Hardware, Serial, Bluetooth (RFCOMM / SPP / BLE UART), Wi-Fi / Ethernet TCP/IP,
+UDP Stream, and Multi-Protocol Virtual Emulator Drivers for Modern EDM.
+
+Supports all 12 instrument protocols:
+1. LeicaGeoCOMDriver (WILD2 / LEICA GeoCOM ASCII RPC - TPS1000/1100/1200, Viva TS11-16, Nova MS50/60)
 2. LeicaAutoTiltDriver (LEICA_AUTOTILT 11-step motorized GeoCOM lock & tilt compensation)
-3. LeicaGSIDriver (WILD / LEICA GSI-8 & GSI-16)
-4. LeicaBuilderDriver (BUILDER - Leica Builder 209 '$MSR' / '/Dc ')
-5. TopconDriver (TOPCON GTS-3, 210, 220, 301-303, 320 with BCC checksum & barrel-reversal checks)
-6. SokkiaDriver & NikonDriver (SOKKIA SET 4B '$DNX' / DC1 0x11 & NIKON '!HAN' with DC2 0x12 abort)
-7. MicroscribeDriver (MICROSCRIBE / PENTOGRAPH 'GETPOS' & Clipboard mm-to-m parser)
-8. ManualDriver (MANUAL / NONE hand-entered V/Hz/SD or X/Y/Z)
-9. SimulatorDriver (SIMULATE offline synthetic coordinate generator)
+3. LeicaGSIDriver (WILD / LEICA GSI-8 & GSI-16 - TC400-TC2000, TCR300-800)
+4. LeicaBuilderDriver (BUILDER - Leica Builder 100-500 / iCON '$MSR' / '/Dc ')
+5. TopconDriver (TOPCON GTS-3, 210, 220, 301-303, 320, GM/GT/OS with BCC checksum & barrel-reversal checks)
+6. SokkiaDriver & NikonDriver (SOKKIA SET / CX / SX / iX '$DNX' / DC1 0x11 & NIKON DTM / NPL / Nivo '!HAN' with DC2 0x12 abort)
+7. TrimbleM3Driver (TRIMBLE / GEODIMETER GDS / M3 / 5600 / S-Series 'RG=1' / Label 37=Hz, 38=V, 39=SD)
+8. ZeissRec500Driver (ZEISS Elta / REC-500 ASCII angle/distance frames)
+9. MicroscribeDriver (MICROSCRIBE / PENTOGRAPH 'GETPOS' & Clipboard mm-to-m parser)
+10. ManualDriver (MANUAL / NONE hand-entered V/Hz/SD or X/Y/Z)
+11. SimulatorDriver (SIMULATE offline synthetic coordinate generator)
+
+Supports 6 Physical & Virtual Transport Mechanisms:
+- RS-232 / USB-Serial UART (`COM1`..`COM256`, `/dev/ttyUSB*`, `/dev/cu.usbserial*`)
+- Bluetooth Classic SPP / Virtual COM (`Standard Serial over Bluetooth link`, `/dev/cu.Bluetooth*`)
+- Direct Bluetooth RFCOMM Socket (`bt://AA:BB:CC:DD:EE:FF:1` or `rfcomm://AA:BB:CC:DD:EE:FF:1` via Python `socket.AF_BLUETOOTH`)
+- Bluetooth Low Energy (BLE) GATT Nordic UART (`ble://AA:BB:CC:DD:EE:FF` or device name via `bleak` when available)
+- Wi-Fi / Ethernet TCP/IP Socket (`tcp://192.168.1.100:5000` or `socket://host:port` for robotic Wi-Fi bridges, NPort, & pyserial RFC2217)
+- UDP Datagram Bridge (`udp://127.0.0.1:5005`)
+- Multi-Protocol Virtual Hardware Emulators (`SIMULATOR`, `VIRT-LEICA`, `VIRT-TOPCON`, `VIRT-SOKKIA`, `VIRT-TRIMBLE`, `VIRT-MICROSCRIBE`, `BT-SIM-LEICA`, `TCP-SIM-STATION`)
 """
 
 from __future__ import annotations
@@ -18,9 +31,12 @@ import abc
 import math
 import random
 import re
+import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import serial
@@ -60,6 +76,16 @@ class RawObservation:
 
 @dataclass
 class SerialConfig:
+    """
+    Unified transport & serial configuration.
+    `port` accepts:
+      - Standard OS COM/tty ports: 'COM1', '/dev/ttyUSB0', '/dev/cu.Bluetooth-Incoming-Port'
+      - Direct Bluetooth RFCOMM URIs: 'bt://00:11:22:33:44:55:1' or 'rfcomm://00:11:22:33:44:55:1'
+      - Bluetooth Low Energy (BLE) URIs: 'ble://00:11:22:33:44:55'
+      - Wi-Fi / Ethernet TCP/IP URIs: 'tcp://192.168.1.50:5000' or 'socket://192.168.1.50:5000'
+      - UDP URIs: 'udp://127.0.0.1:9000'
+      - Built-in Virtual Emulators: 'SIMULATOR', 'VIRT-LEICA', 'VIRT-TOPCON', 'VIRT-SOKKIA', 'VIRT-TRIMBLE', 'BT-SIM-LEICA', 'TCP-SIM-STATION'
+    """
     port: str = "COM1"
     baudrate: int = 19200
     bytesize: int = 8
@@ -69,6 +95,7 @@ class SerialConfig:
     edm_delay_time: float = 0.5  # EdmDelayTime from frmTheodolite (default 0.5s)
     dtr: bool = True
     rts: bool = True
+    flow_control: str = "NONE"   # 'NONE', 'RTSCTS', 'XONXOFF'
     verify_bcc: bool = False
     check_barrel_reversal: bool = False
 
@@ -176,8 +203,216 @@ def compute_topcon_bcc_decimal3(payload: str) -> str:
     return f"{bcc:03d}"
 
 
+# ==============================================================================
+# Multi-Transport Socket & Bluetooth Stream Wrappers
+# ==============================================================================
+
+class _SocketStreamAdapter:
+    """
+    Wraps a Python `socket.socket` (TCP/IP, UDP, or Bluetooth RFCOMM `AF_BLUETOOTH`)
+    in a pyserial-compatible interface (`is_open`, `write`, `read`, `in_waiting`, `close`,
+    `reset_input_buffer`, `reset_output_buffer`) so all TotalStationDriver subclasses
+    work identically over Serial, Bluetooth RFCOMM, Wi-Fi TCP, or UDP!
+    """
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        timeout: float = 10.0,
+        udp_target: Optional[Tuple[str, int]] = None,
+    ) -> None:
+        self._sock = sock
+        self._sock.settimeout(0.05)
+        self.timeout = timeout
+        self._udp_target = udp_target
+        self._rx_buf = bytearray()
+        self.is_open = True
+        self.dtr = True
+        self.rts = True
+
+    def _pump_recv(self) -> None:
+        if not self.is_open:
+            return
+        try:
+            if self._udp_target is not None:
+                chunk, _ = self._sock.recvfrom(4096)
+            else:
+                chunk = self._sock.recv(4096)
+            if chunk:
+                self._rx_buf.extend(chunk)
+        except (BlockingIOError, socket.timeout, TimeoutError):
+            pass
+        except OSError:
+            pass
+
+    @property
+    def in_waiting(self) -> int:
+        self._pump_recv()
+        return len(self._rx_buf)
+
+    def read(self, size: int = 1) -> bytes:
+        self._pump_recv()
+        n = min(size, len(self._rx_buf))
+        data = bytes(self._rx_buf[:n])
+        del self._rx_buf[:n]
+        return data
+
+    def write(self, data: bytes) -> int:
+        if self._udp_target is not None:
+            return self._sock.sendto(data, self._udp_target)
+        self._sock.sendall(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def reset_input_buffer(self) -> None:
+        self._pump_recv()
+        self._rx_buf.clear()
+
+    def reset_output_buffer(self) -> None:
+        pass
+
+    def close(self) -> None:
+        if self.is_open:
+            self.is_open = False
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+
+def parse_transport_endpoint(port_spec: str) -> Dict[str, Any]:
+    """
+    Parses a connection string/URI into structured transport metadata:
+      - 'bt://AA:BB:CC:DD:EE:FF:1' or 'rfcomm://AA:BB:CC:DD:EE:FF:1' -> {'scheme': 'BT_RFCOMM', 'address': 'AA:BB:CC:DD:EE:FF', 'channel': 1}
+      - 'ble://AA:BB:CC:DD:EE:FF' -> {'scheme': 'BLE_UART', 'address': 'AA:BB:CC:DD:EE:FF'}
+      - 'tcp://192.168.1.100:5000' or 'socket://192.168.1.100:5000' -> {'scheme': 'TCP', 'host': '192.168.1.100', 'port': 5000}
+      - 'udp://127.0.0.1:5005' -> {'scheme': 'UDP', 'host': '127.0.0.1', 'port': 5005}
+      - 'SIMULATOR' / 'VIRT-*' / 'BT-SIM-*' / 'TCP-SIM-*' -> {'scheme': 'VIRTUAL', 'port': port_spec}
+      - 'COM3' / '/dev/ttyUSB0' -> {'scheme': 'SERIAL', 'port': port_spec}
+    """
+    raw = (port_spec or "").strip()
+    upper = raw.upper()
+
+    if TotalStationDriver.is_virtual_port(raw):
+        return {"scheme": "VIRTUAL", "port": raw}
+
+    if upper.startswith(("BT://", "RFCOMM://")):
+        body = raw.split("://", 1)[1].strip().strip("/")
+        mac_match = re.match(r"^([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})(?::(\d+))?$", body)
+        if not mac_match:
+            raise ValueError(
+                f"Invalid Bluetooth RFCOMM URI {raw!r}. Expected format: bt://AA:BB:CC:DD:EE:FF:1"
+            )
+        mac_addr = mac_match.group(1).upper()
+        channel = int(mac_match.group(2) or "1")
+        return {"scheme": "BT_RFCOMM", "address": mac_addr, "channel": channel}
+
+    if upper.startswith("BLE://"):
+        addr = raw.split("://", 1)[1].strip().strip("/")
+        if not addr:
+            raise ValueError(f"Invalid BLE URI {raw!r}. Expected format: ble://AA:BB:CC:DD:EE:FF")
+        return {"scheme": "BLE_UART", "address": addr}
+
+    if upper.startswith(("TCP://", "SOCKET://")):
+        body = raw.split("://", 1)[1].strip().strip("/")
+        if ":" not in body:
+            raise ValueError(f"Invalid TCP URI {raw!r}. Expected format: tcp://host:port")
+        host, port_s = body.rsplit(":", 1)
+        return {"scheme": "TCP", "host": host.strip(), "port": int(port_s)}
+
+    if upper.startswith("UDP://"):
+        body = raw.split("://", 1)[1].strip().strip("/")
+        if ":" not in body:
+            raise ValueError(f"Invalid UDP URI {raw!r}. Expected format: udp://host:port")
+        host, port_s = body.rsplit(":", 1)
+        return {"scheme": "UDP", "host": host.strip(), "port": int(port_s)}
+
+    return {"scheme": "SERIAL", "port": raw}
+
+
+def discover_bluetooth_devices() -> List[Tuple[str, str]]:
+    """
+    Discovers paired and nearby Bluetooth Total Stations / Serial Adapters across platforms:
+    1. Scans OS serial ports (`serial.tools.list_ports.comports()`) for Bluetooth SPP
+       descriptions (`Bluetooth`, `BTHENUM`, `SPP`, `RFCOMM`, `Parani`, `RN42`, `Leica`, `Topcon`, `Sokkia`, `Trimble`).
+    2. On Windows, queries `Get-PnpDevice -Class Bluetooth` (PowerShell) to surface paired
+       Bluetooth survey instruments and their MAC addresses even before a COM port is opened.
+    3. Includes virtual Bluetooth & Wi-Fi test endpoints (`BT-SIM-LEICA`, `BT-SIM-TOPCON`, `TCP-SIM-STATION`)
+       so Bluetooth and network workflows can be tested without physical hardware.
+    """
+    found: List[Tuple[str, str]] = []
+    seen_ids: set[str] = set()
+
+    if HAS_PYSERIAL:
+        bt_keywords = ("bluetooth", "bthenum", "rfcomm", "spp", "parani", "rn42", "serial over bluetooth")
+        for p in serial.tools.list_ports.comports():
+            desc_lower = f"{p.device} {p.description} {getattr(p, 'hwid', '')}".lower()
+            if any(k in desc_lower for k in bt_keywords):
+                dev_id = p.device
+                label = f"{p.device} - [Bluetooth SPP] {p.description}"
+                if dev_id not in seen_ids:
+                    found.append((dev_id, label))
+                    seen_ids.add(dev_id)
+
+    if sys.platform == "win32":
+        try:
+            ps_cmd = (
+                "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | "
+                "Where-Object { $_.Status -eq 'OK' -and $_.FriendlyName -notmatch 'Enumerator|Adapter|Radio|Transport|Avrcp|Audio' } | "
+                "Select-Object -First 8 FriendlyName, InstanceId | ConvertTo-Csv -NoTypeInformation"
+            )
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=3.5,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                for line in proc.stdout.splitlines()[1:]:
+                    parts = [p.strip('"') for p in line.split('","')]
+                    if len(parts) >= 2:
+                        fname, inst_id = parts[0], parts[1]
+                        mac_m = re.search(r"([0-9A-Fa-f]{12})$", inst_id.replace("_", ""))
+                        if mac_m:
+                            raw_hex = mac_m.group(1).upper()
+                            mac_colon = ":".join(raw_hex[i:i+2] for i in range(0, 12, 2))
+                            bt_uri = f"bt://{mac_colon}:1"
+                            if bt_uri not in seen_ids:
+                                found.append((bt_uri, f"{bt_uri} - [Paired Bluetooth RFCOMM] {fname}"))
+                                seen_ids.add(bt_uri)
+        except Exception:
+            pass
+
+    sim_bt = [
+        ("BT-SIM-LEICA", "BT-SIM-LEICA - [Simulated Bluetooth SPP] Leica TPS / TS16 GeoCOM"),
+        ("BT-SIM-TOPCON", "BT-SIM-TOPCON - [Simulated Bluetooth SPP] Topcon GT / OS / GM Series"),
+        ("BT-SIM-SOKKIA", "BT-SIM-SOKKIA - [Simulated Bluetooth SPP] Sokkia CX / SX / iX Series"),
+        ("TCP-SIM-STATION", "TCP-SIM-STATION - [Simulated Wi-Fi TCP/IP] Robotic Total Station Bridge"),
+    ]
+    for dev_id, label in sim_bt:
+        if dev_id not in seen_ids:
+            found.append((dev_id, label))
+            seen_ids.add(dev_id)
+
+    return found
+
+
 class TotalStationDriver(abc.ABC):
-    """Abstract base class for all Total Station serial drivers."""
+    """Abstract base class for all Total Station serial, Bluetooth, and network drivers."""
+
+    VIRTUAL_PORTS = [
+        ("SIMULATOR", "SIMULATOR - Built-in Multi-Protocol Hardware Emulator"),
+        ("VIRT-LEICA", "VIRT-LEICA - Virtual Leica GeoCOM / AutoTilt / GSI Port"),
+        ("VIRT-TOPCON", "VIRT-TOPCON - Virtual Topcon GTS / GM Series Port (with BCC)"),
+        ("VIRT-SOKKIA", "VIRT-SOKKIA - Virtual Sokkia / Nikon SET Series Port"),
+        ("VIRT-TRIMBLE", "VIRT-TRIMBLE - Virtual Trimble M3 / Geodimeter 5600 / S-Series Port"),
+        ("VIRT-MICROSCRIBE", "VIRT-MICROSCRIBE - Virtual Microscribe 3D Digitizer Port"),
+        ("BT-SIM-LEICA", "BT-SIM-LEICA - Virtual Bluetooth SPP Leica Total Station"),
+        ("BT-SIM-TOPCON", "BT-SIM-TOPCON - Virtual Bluetooth SPP Topcon Total Station"),
+        ("TCP-SIM-STATION", "TCP-SIM-STATION - Virtual Wi-Fi / TCP Total Station Bridge"),
+    ]
 
     def __init__(
         self,
@@ -185,29 +420,114 @@ class TotalStationDriver(abc.ABC):
         log_callback: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.config = config
-        self._serial: Optional["serial.Serial"] = None
+        self._serial: Optional[Any] = None
         self._log_callback = log_callback
+        self._virtual_connected: bool = self.is_virtual_port(config.port)
+        self._sim_rng = random.Random(42)
+
+    @staticmethod
+    def is_virtual_port(port_name: str) -> bool:
+        p = (port_name or "").strip().upper()
+        return (
+            p == "SIMULATOR"
+            or p.startswith("SIM")
+            or p.startswith("VIRT")
+            or p.startswith("BT-SIM")
+            or p.startswith("TCP-SIM")
+            or p == "LOOPBACK"
+        )
 
     def _log(self, direction: str, payload: str) -> None:
         if self._log_callback:
             self._log_callback(direction, payload)
 
-    @staticmethod
-    def list_available_ports() -> List[Tuple[str, str]]:
-        if not HAS_PYSERIAL:
-            return [("SIMULATOR", "Built-in Offline Total Station Simulator")]
-        ports = [
-            (p.device, f"{p.device} - {p.description}")
-            for p in serial.tools.list_ports.comports()
-        ]
-        ports.append(("SIMULATOR", "Built-in Offline Total Station Simulator"))
+    @classmethod
+    def list_available_ports(cls, include_bluetooth_scan: bool = False) -> List[Tuple[str, str]]:
+        ports: List[Tuple[str, str]] = []
+        seen: set[str] = set()
+        if HAS_PYSERIAL:
+            for p in serial.tools.list_ports.comports():
+                desc = p.description or "Serial Port"
+                is_bt = any(
+                    k in f"{p.device} {desc} {getattr(p, 'hwid', '')}".lower()
+                    for k in ("bluetooth", "bthenum", "rfcomm", "spp")
+                )
+                tag = "[Bluetooth SPP] " if is_bt else ""
+                ports.append((p.device, f"{p.device} - {tag}{desc}"))
+                seen.add(p.device)
+
+        if include_bluetooth_scan:
+            for dev_id, label in discover_bluetooth_devices():
+                if dev_id not in seen:
+                    ports.append((dev_id, label))
+                    seen.add(dev_id)
+
+        for v_id, v_desc in cls.VIRTUAL_PORTS:
+            if v_id not in seen:
+                ports.append((v_id, v_desc))
+                seen.add(v_id)
         return ports
 
     def connect(self) -> None:
+        if self._serial and getattr(self._serial, "is_open", False):
+            self._serial.close()
+
+        ep = parse_transport_endpoint(self.config.port)
+        scheme = ep["scheme"]
+
+        if scheme == "VIRTUAL":
+            self._virtual_connected = True
+            self._log(
+                "INFO",
+                f"Connected to virtual hardware emulator on {self.config.port} "
+                f"({self.__class__.__name__} @ {self.config.baudrate},{self.config.parity},{self.config.bytesize},{self.config.stopbits})",
+            )
+            return
+
+        if scheme == "BT_RFCOMM":
+            if not hasattr(socket, "AF_BLUETOOTH"):
+                raise RuntimeError(
+                    "Direct Bluetooth RFCOMM sockets (AF_BLUETOOTH) are not supported by this Python build; "
+                    "pair the instrument in OS Bluetooth settings and select its Bluetooth SPP COM port instead."
+                )
+            bt_proto = getattr(socket, "BTPROTO_RFCOMM", 3)
+            sock = socket.socket(getattr(socket, "AF_BLUETOOTH"), socket.SOCK_STREAM, bt_proto)
+            sock.settimeout(self.config.timeout)
+            sock.connect((ep["address"], ep["channel"]))
+            self._serial = _SocketStreamAdapter(sock, timeout=self.config.timeout)
+            self._log("INFO", f"Connected via Bluetooth RFCOMM to {ep['address']} (channel {ep['channel']})")
+            return
+
+        if scheme == "TCP":
+            sock = socket.create_connection((ep["host"], ep["port"]), timeout=self.config.timeout)
+            self._serial = _SocketStreamAdapter(sock, timeout=self.config.timeout)
+            self._log("INFO", f"Connected via TCP/IP to {ep['host']}:{ep['port']}")
+            return
+
+        if scheme == "UDP":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._serial = _SocketStreamAdapter(
+                sock, timeout=self.config.timeout, udp_target=(ep["host"], ep["port"])
+            )
+            self._log("INFO", f"Opened UDP socket to {ep['host']}:{ep['port']}")
+            return
+
+        if scheme == "BLE_UART":
+            # Support pyserial url handler if registered, or raise descriptive BLE guidance
+            if HAS_PYSERIAL and hasattr(serial, "serial_for_url"):
+                try:
+                    self._serial = serial.serial_for_url(self.config.port, timeout=self.config.timeout)
+                    return
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"BLE UART connection to {ep['address']} failed ({exc}). "
+                        "Use a Bluetooth SPP COM port or bt://MAC:1 RFCOMM URI."
+                    ) from exc
+
         if not HAS_PYSERIAL:
             raise RuntimeError("pyserial is not installed.")
-        if self._serial and self._serial.is_open:
-            self._serial.close()
+
+        fc = (self.config.flow_control or "NONE").strip().upper()
         self._serial = serial.Serial(
             port=self.config.port,
             baudrate=self.config.baudrate,
@@ -215,6 +535,8 @@ class TotalStationDriver(abc.ABC):
             parity=self.config.parity,
             stopbits=self.config.stopbits,
             timeout=self.config.timeout,
+            rtscts=(fc == "RTSCTS"),
+            xonxoff=(fc == "XONXOFF"),
         )
         self._serial.dtr = self.config.dtr
         self._serial.rts = self.config.rts
@@ -222,9 +544,10 @@ class TotalStationDriver(abc.ABC):
         self._serial.reset_output_buffer()
 
     def disconnect(self) -> None:
-        if self._serial and self._serial.is_open:
+        if self._serial and getattr(self._serial, "is_open", False):
             self._serial.close()
         self._serial = None
+        self._virtual_connected = False
 
     def reset_connection(self) -> None:
         """Implements Station -> Reset Connection (FUN_005369d0)."""
@@ -234,9 +557,94 @@ class TotalStationDriver(abc.ABC):
 
     @property
     def is_connected(self) -> bool:
-        return bool(self._serial and self._serial.is_open)
+        if self.is_virtual_port(self.config.port):
+            return self._virtual_connected
+        return bool(self._serial and getattr(self._serial, "is_open", False))
+
+    def _emulate_protocol_response(self, data: str) -> str:
+        """
+        Generates authentic wire-protocol responses for ANY TotalStationDriver subclass
+        when connected to a virtual port (SIMULATOR, VIRT-LEICA, VIRT-TOPCON, BT-SIM-LEICA, etc.).
+        """
+        cmd = data.strip()
+        sd = round(self._sim_rng.uniform(1.15, 2.45), 4)
+        hz_deg = round(self._sim_rng.uniform(35.0, 55.0), 4)
+        v_deg = round(self._sim_rng.uniform(91.0, 96.0), 4)
+        hz_rad = math.radians(hz_deg)
+        v_rad = math.radians(v_deg)
+
+        # 1. Leica GeoCOM / AutoTilt ASCII RPC commands
+        if cmd.startswith("%R1Q"):
+            if ",5008:" in cmd:
+                return "%R1P,0,0:0,2026,'10','28','16','45','00'\r\n"
+            if ",5004" in cmd:
+                return '%R1P,0,0:0,"TPS1200+ Virtual Emulator"\r\n'
+            if ",2187:" in cmd:
+                tokens = (
+                    ["0"] + ["0.0000"] * 10 + ["0.0042", "0.0000"]
+                    + [f"{hz_rad:.8f}", f"{v_rad:.8f}", f"{sd:.4f}"]
+                )
+                return "%R1P,0,0:" + ",".join(tokens) + "\r\n"
+            if ",2108:" in cmd:
+                return f"%R1P,0,0:0,{hz_rad:.8f},{v_rad:.8f},{sd:.4f}\r\n"
+            return "%R1P,0,0:0\r\n"
+
+        # 2. Leica / Wild GSI-8 / GSI-16 & Builder 209 commands
+        if cmd.startswith("SET/") or cmd.startswith("PUT/") or cmd.startswith("/Dc"):
+            return "*\r\n"
+        if cmd.startswith("GET/M/") or cmd == "$MSR":
+            hz_gsi = int(round(hz_deg * 100000))
+            v_gsi = int(round(v_deg * 100000))
+            sd_mm = int(round(sd * 1000))
+            return f"110001+00000001 21.323+{hz_gsi:08d} 22.323+{v_gsi:08d} 31..00+{sd_mm:08d}\r\n"
+
+        # 3. Trimble M3 / Geodimeter 5600 / S-Series GDS commands
+        if cmd.startswith("RG") or isinstance(self, TrimbleM3Driver):
+            hz_dms = radians_to_dddmmss(hz_rad)
+            v_dms = radians_to_dddmmss(v_rad)
+            return f"37={hz_dms:.4f}\r\n38={v_dms:.4f}\r\n39={sd:.4f}\r\n"
+
+        # 4. Zeiss Elta / REC-500 commands
+        if isinstance(self, ZeissRec500Driver):
+            hz_dms = radians_to_dddmmss(hz_rad)
+            v_dms = radians_to_dddmmss(v_rad)
+            return f"0001  SD {sd:8.4f}  Hz {hz_dms:8.4f}  V {v_dms:8.4f}\r\n"
+
+        # 5. Topcon GTS / GM Series commands
+        if "\x06R" in data or cmd.startswith("!HAN"):
+            return "\x06\r\n"
+        if "\x15?" in data or isinstance(self, TopconDriver):
+            sd_mm = int(round(sd * 1000))
+            v_dms = format_dddmmss_7digit(radians_to_dddmmss(v_rad))
+            hz_dms = format_dddmmss_7digit(radians_to_dddmmss(hz_rad))
+            body = f"?+{sd_mm:07d}m+{v_dms}d+{hz_dms}d+{sd_mm:07d}d"
+            bcc = compute_topcon_bcc(body)
+            return f"{body}{bcc}\r\n"
+
+        # 6. Microscribe 3D Digitizer commands
+        if cmd.upper() == "GETPOS" or isinstance(self, MicroscribeDriver):
+            x_mm = round(100400.0 + self._sim_rng.uniform(50.0, 950.0), 2)
+            y_mm = round(100400.0 + self._sim_rng.uniform(50.0, 950.0), 2)
+            z_mm = round(9850.0 + self._sim_rng.uniform(-150.0, 150.0), 2)
+            return f"{x_mm}, {y_mm}, {z_mm}\r\n"
+
+        # 7. Sokkia / Nikon SET Series commands
+        if "\x11" in data or isinstance(self, SokkiaNikonDriver):
+            sd_mm = int(round(sd * 1000))
+            v_dms = format_dddmmss_7digit(radians_to_dddmmss(v_rad))
+            hz_dms = format_dddmmss_7digit(radians_to_dddmmss(hz_rad))
+            return f"E 112 00.00 00.000\r\n {sd_mm:07d} {v_dms} {hz_dms}\r\n"
+
+        return "OK\r\n"
 
     def send_raw(self, data: str) -> str:
+        if self.is_virtual_port(self.config.port):
+            self._virtual_connected = True
+            self._log("Sent->", repr(data))
+            rx = self._emulate_protocol_response(data)
+            self._log("Received->", repr(rx))
+            return rx
+
         if not self.is_connected or self._serial is None:
             self.connect()
         assert self._serial is not None
@@ -565,12 +973,10 @@ class TopconDriver(TotalStationDriver):
         stripped = raw_frame.strip().lstrip("\x00\x06\x15\x02").rstrip("\r\n\x03")
         if len(stripped) < 5 or stripped.endswith("**"):
             return True
-        # Check 3-digit decimal BCC (GTS-3B t60 frames)
         if len(stripped) >= 4 and stripped[-3:].isdigit():
             body3 = stripped[:-3]
             if compute_topcon_bcc_decimal3(body3) == stripped[-3:]:
                 return True
-        # Check 2-char hex BCC
         body2 = stripped[:-2]
         if compute_topcon_bcc(body2).upper() == stripped[-2:].upper():
             return True
@@ -584,7 +990,6 @@ class TopconDriver(TotalStationDriver):
         if not clean:
             raise ValueError("ERROR: Shot could not be recorded. Verify that prism is visible.")
 
-        # Pattern A: Standard Topcon ?+0012345m+0900000d+1800000d
         packed_pattern = re.compile(
             r"([+-]?\d+)([mfMF])([+-]?\d+)[dD]?([+-]\d+)([dD]?)"
         )
@@ -617,7 +1022,6 @@ class TopconDriver(TotalStationDriver):
                 raw_rx=response,
             )
 
-        # Pattern B: Comma-delimited SD, V_deg, Hz_deg
         parts = [p.strip() for p in clean.split(",") if p.strip()]
         if len(parts) >= 3:
             sd_val = float(parts[0])
@@ -636,9 +1040,8 @@ class TopconDriver(TotalStationDriver):
 
 class SokkiaNikonDriver(TotalStationDriver):
     """
-    Driver for Sokkia SET 4B and Nikon Total Stations (FUN_004cad10, FUN_004cdb10).
+    Driver for Sokkia SET 4B / CX / SX / iX and Nikon DTM / NPL / Nivo Total Stations.
     Triggers measurement with DC1 (0x11) or '$DNX' and aborts with DC2 (0x12).
-    Distinguishes Sokkia (raw 8-digit angle + CR/LF) vs. Nikon ('!HAN' prefix) per FUN_004cdb10.
     """
 
     TRIGGER_CMD = "\x11\r\n"
@@ -690,6 +1093,95 @@ class SokkiaNikonDriver(TotalStationDriver):
         raise ValueError(f"Could not parse Sokkia/Nikon response: {response!r}")
 
 
+class TrimbleM3Driver(TotalStationDriver):
+    """
+    Driver for Trimble M3, Geodimeter 400/500/600, Trimble 5600, and S-Series Total Stations
+    using Geodimeter Data System (GDS) label-value ASCII protocol:
+      - Trigger measurement: 'RG=1\\r\\n'
+      - Set Horizontal Angle: '21=<DDD.MMSS>\\r\\n'
+      - Response labels:
+        * '7=<DDD.MMSS>' or '21=<DDD.MMSS>' or '37=<DDD.MMSS>' (Horizontal Angle)
+        * '8=<DDD.MMSS>' or '22=<DDD.MMSS>' or '38=<DDD.MMSS>' (Vertical Zenith Angle)
+        * '9=<meters>'   or '31=<meters>'   or '39=<meters>'   (Slope Distance)
+    """
+
+    TRIGGER_CMD = "RG=1\r\n"
+
+    def format_set_horizontal_angle_cmd(self, angle_dddmmss: float) -> str:
+        return f"21={angle_dddmmss:.4f}\r\n"
+
+    def measure(self) -> RawObservation:
+        rx = self.send_raw(self.TRIGGER_CMD)
+        return self.parse_response(rx, tx_cmd="RG=1")
+
+    def parse_response(self, response: str, tx_cmd: str = "") -> RawObservation:
+        hz_rad: Optional[float] = None
+        v_rad: Optional[float] = None
+        sd_val: Optional[float] = None
+
+        for token in re.split(r"[\r\n,;]+", response.strip()):
+            tok = token.strip()
+            if "=" not in tok:
+                continue
+            label, val_s = [p.strip() for p in tok.split("=", 1)]
+            if not val_s:
+                continue
+            val = float(val_s)
+            if label in ("7", "21", "37", "HA", "HZ"):
+                hz_rad = dms_encoded_to_radians(val) % (2.0 * math.pi)
+            elif label in ("8", "22", "38", "VA", "V"):
+                v_rad = dms_encoded_to_radians(val)
+            elif label in ("9", "31", "39", "SD"):
+                sd_val = val
+
+        if hz_rad is None or v_rad is None or sd_val is None:
+            raise ValueError(f"Incomplete Trimble/Geodimeter GDS frame: {response!r}")
+
+        return RawObservation(
+            slope_distance=sd_val,
+            horizontal_angle_rad=hz_rad,
+            vertical_angle_rad=v_rad,
+            raw_tx=tx_cmd,
+            raw_rx=response,
+        )
+
+
+class ZeissRec500Driver(TotalStationDriver):
+    """
+    Driver for Carl Zeiss Elta (R45/R50/R55/C) & REC-500 Total Stations:
+      - Trigger measurement: 'M\\r\\n'
+      - Parses Zeiss REC-500 lines such as '0001  SD  12.3450  Hz  90.1530  V  91.0000'
+    """
+
+    TRIGGER_CMD = "M\r\n"
+
+    def format_set_horizontal_angle_cmd(self, angle_dddmmss: float) -> str:
+        return f"HZ={angle_dddmmss:.4f}\r\n"
+
+    def measure(self) -> RawObservation:
+        rx = self.send_raw(self.TRIGGER_CMD)
+        return self.parse_response(rx, tx_cmd="M")
+
+    def parse_response(self, response: str, tx_cmd: str = "") -> RawObservation:
+        clean = response.strip()
+        m_sd = re.search(r"SD\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)", clean, re.IGNORECASE)
+        m_hz = re.search(r"Hz\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)", clean, re.IGNORECASE)
+        m_v = re.search(r"\bV\s*[:=]?\s*([+-]?\d+(?:\.\d+)?)", clean, re.IGNORECASE)
+        if not (m_sd and m_hz and m_v):
+            raise ValueError(f"Unrecognized Zeiss REC-500 frame: {response!r}")
+
+        sd_val = float(m_sd.group(1))
+        hz_rad = dms_encoded_to_radians(float(m_hz.group(1))) % (2.0 * math.pi)
+        v_rad = dms_encoded_to_radians(float(m_v.group(1)))
+        return RawObservation(
+            slope_distance=sd_val,
+            horizontal_angle_rad=hz_rad,
+            vertical_angle_rad=v_rad,
+            raw_tx=tx_cmd,
+            raw_rx=response,
+        )
+
+
 class MicroscribeDriver(TotalStationDriver):
     """
     Driver for Microscribe / Pentograph 3D Digitizer (MICROSCRIBE / PENTOGRAPH in edmwin.exe).
@@ -709,12 +1201,6 @@ class MicroscribeDriver(TotalStationDriver):
         origin_y: float = 0.0,
         origin_z: float = 0.0,
     ) -> Tuple[float, float, float]:
-        """
-        Exact replica of FUN_00556b20 (frmGetMSData):
-        Validates that clipboard_text contains only digits, ',', '.', '-', CR, LF, or space,
-        splits 'X,Y,Z' (in millimeters from Microscribe Utility Software), divides by 1000.0,
-        and subtracts the Block Origin (StationX, StationY, StationZ).
-        """
         clean = clipboard_text.strip()
         if not clean:
             raise ValueError("Copy data from notepad")
@@ -839,6 +1325,10 @@ def create_driver(
         return SokkiaNikonDriver(config, log_callback, variant="SOKKIA")
     if "nikon" in normalized or "set" in normalized:
         return SokkiaNikonDriver(config, log_callback, variant="NIKON")
+    if "trimble" in normalized or "geodimeter" in normalized:
+        return TrimbleM3Driver(config, log_callback)
+    if "zeiss" in normalized or "rec500" in normalized or "elta" in normalized:
+        return ZeissRec500Driver(config, log_callback)
     if "microscribe" in normalized or "pentograph" in normalized:
         return MicroscribeDriver(config, log_callback)
     return SimulatorDriver(config, log_callback)

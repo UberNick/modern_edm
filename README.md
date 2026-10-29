@@ -2,7 +2,7 @@
 
 **Modern EDM** is a cross-platform (Windows & macOS) Python/PySide6 replacement for the legacy Visual Basic 6 **EDM Windows (`edmwin.exe` v3.2 / v3.05.0010)** total-station surveying program originally developed by Harold L. Dibble and Shannon P. McPherron (`OldStoneAge.com`).
 
-Built from a complete Ghidra decompilation and subsystem audit of `edmwin.exe`, Modern EDM preserves 100% wire-protocol, mathematical, and `.CFG` workflow parity with legacy archaeological excavations while replacing the 32-bit Microsoft Jet/DAO `.mdb` engine with crash-safe atomic SQLite (WAL) storage, live 2D Plan/Section plotting, and QGIS GeoJSON export.
+Built from a complete Ghidra decompilation and subsystem audit of `edmwin.exe`, Modern EDM preserves 100% wire-protocol, mathematical, UI dialog, and `.CFG` workflow parity with legacy archaeological excavations while replacing the 32-bit Microsoft Jet/DAO `.mdb` engine with crash-safe atomic SQLite (WAL) storage, live 2D Plan/Section plotting, and QGIS GeoJSON export.
 
 ---
 
@@ -29,16 +29,27 @@ Supports all 9 instrument modes from `edmwin.exe`:
 - **Station Verify (`frmStationVerify`):** Shoots a known control nail and reports `(dX, dY, dZ)`, 2D/3D error, and horizontal distance residual.
 - **6-Way Post-Shot Coordinate Offset (`frmOffSet`):** `Offset East`, `West`, `North`, `South`, `Up`, and `Down` with 1 km sanity guard and cross-unit boundary detection.
 
-### 3. Legacy `.CFG` & Excavation Workflow Parity (`storage/cfg_parser.py`, `storage/database.py`)
-- **Multi-Field SpeedButtons (`[BUTTON1]`–`[BUTTON6]`):** Supports `TITLE=`, `Shortcut=` (`Ctrl+Key`), and multi-field presets (including safe `UNIT` switching without skipping `ID` numbers).
-- **Unit-Scoped Carryover Fields (`Unitfields=`):** Automatically saves and restores `ID`, `LEVEL`, and `EXCAVATOR` per excavation unit when switching units.
-- **Multi-Shot Continuation (`+Shot`) & Series Resequencing:** Validates initial series records (`SUFFIX=0`), locks `UNIT` within an active series, and automatically resequences subsequent `SUFFIX` numbers if a point in a series is deleted.
-- **Duplicate ID Resolution (`frmDupID`):** Interactive 3-way resolution (**Convert to alpha ID** `42a`, **New ID**, or **Continuation `+Shot`**).
-- **Exporters & Label Printing:**
-  - 4-Table Legacy EDMWin CSV Bundle (`_points.csv`, `_datums.csv`, `_prisms.csv`, `_units.csv`)
-  - Single-file CSV Import/Export
-  - QGIS GeoJSON Export (`Point` features + automatic `LineString` reconstruction for multi-shot sequences)
-  - ASCII & Zebra ZPL II (Code-39 barcode) artifact bag label spooler (`storage/label_printer.py`)
+### 3. Complete `edmwin.exe` Form & Dialog Parity (`ui/dialogs.py`, `ui/main_window.py`)
+
+| Legacy VB6 Form | Modern PySide6 Class | Capabilities |
+| :--- | :--- | :--- |
+| `frmRecord` | `EDMMainWindow` | Dynamic `.CFG` form, `[BUTTON1]`–`[BUTTON6]` speedbutton bar, live 2D Plan/Section plot canvas (`XY`/`XZ`/`YZ`), and points table. |
+| `frmStationSetup` / `frmStationVerify` | `StationSetupDialog` | 5-tab wizard for Direct, 1-Point, 2-Point Backsight, N-Point Resection, and Station Verify. |
+| `frmEditField` | `CFGFieldEditorDialog` | Visual `.CFG` field & menu editor (up to 30 fields, Carry/Increment/UnitField flags, and Quick-Add Angles/Date/Time/Datum Info buttons). |
+| `frmButtons` | `SpeedButtonEditorDialog` | Visual 6-slot macro editor with Caption, `Ctrl+<Key>` shortcut conflict check, Alpha/Numeric ID toggle, and multi-field presets. |
+| `frmDataGrid` | `DataGridDialog` | Full spreadsheet view with column-visibility checklist, inline cell editing, and series-aware row deletion. |
+| `frmFilter` | `FieldFilterDialog` | Distinct field/value browser (`SELECT DISTINCT`) and Current-Station filter. |
+| `frmSubUnits` | `ContextDefaultsDialog` | Master/Dependent variable default linking (`EDM_Defaults`) with live auto-fill and post-shot rule learning. |
+| `frmManualshot` | `ManualShotDialog` | Hand-entered `ddd.mmss` angles + slope distance + pole height or direct `(X, Y, Z)` coordinates. |
+| `frmDupID` | `DuplicateIDDialog` | 3-way duplicate ID resolution (**Convert to alpha ID** `42a`, **New ID**, or **Continuation `+Shot`**). |
+| `frmOffSet` | `OffsetPointDialog` | 6-directional post-shot coordinate offset (`East`, `West`, `North`, `South`, `Up`, `Down`) with 1 km guard. |
+| `frmDatumSheet` / `frmPolesheet` / `AddUnits` | `EntityManagerDialog` | CRUD managers for Control Datums, Prisms (`[-10, 10]` m height, `[-0.05, 0.05]` m offset), and Excavation Units (`RECT`, `CIRCLE`, `NOLIMITS`). |
+| `frmTheodolite` | `SerialTerminalDialog` | Total station protocol selector, COM/Bluetooth port scanner, and raw ASCII serial diagnostic terminal. |
+| `frmDebug` | `DebugStationDialog` | Hardware Initialize, X-Shot coordinate test, and 5 GeoCOM preset commands (`0 Horizontal Angle`, `Get date/time`, `Get Instr. Name`, `Launch measurement`, `Get meas. with tilt`). |
+| `frmSetupLogFiles` | `SetupLogFilesDialog` | Timestamped Total Station serial log (`TSLogFile`) and General setup log (`GeneralLogFile`) configuration and clearing. |
+| `frmDefault` | `CreateDefaultProjectDialog` | Paleolithic default `.CFG` and database generator (`Main` datum, `Zero`/`10cm` prisms, `Unit1`/`Unit2` units). |
+| `modPrint` | `LabelPrinterDialog` | Live preview and multi-copy reprint spooler for Plain-Text ASCII and Zebra ZPL II (Code-39 barcode) artifact bag labels. |
+| `frmStatus` / `frmHelp` / `frmAbout` | `EDMStatusDialog` / `HelpViewerDialog` / `AboutDialog` | Full optical-center status summary, searchable 8-topic offline field manual (`[F1]`), and credits. |
 
 ---
 
@@ -60,7 +71,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 ### Windows (`dist\ModernEDM.exe`)
 ```powershell
-.\build_windows.bat
+python build_release.py
 ```
 
 ### macOS (`dist/ModernEDM.app` & `dist/ModernEDM-macOS.dmg`)
