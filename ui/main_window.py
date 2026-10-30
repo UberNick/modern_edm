@@ -742,7 +742,16 @@ class EDMMainWindow(QMainWindow):
                     prism_offset=prism.offset,
                 )
 
-            # 5. Auto-Find Unit if enabled (mnuFindUnit / FindUnit)
+            # 5. Trap zero slope distance or station-coordinate collision (surf3-edm edm.py:665)
+            if obs.direct_xyz is None and obs.slope_distance <= 0.0:
+                QMessageBox.warning(
+                    self,
+                    "Zero Distance Error",
+                    "The station returned a slope distance of 0. Retake the shot.",
+                )
+                return
+
+            # 5b. Auto-Find Unit if enabled (mnuFindUnit / FindUnit)
             if self.cfg.auto_find_unit and not is_continuation:
                 matched_unit = auto_find_unit(pt, self.db.list_units())
                 if matched_unit is not None and matched_unit.name.upper() != unit_name.upper():
@@ -813,8 +822,16 @@ class EDMMainWindow(QMainWindow):
                         self.db.update_context_default_rule(v, values)
                         break
 
+            prev_num_ids = {}
+            max_num_id = self.db.get_max_numeric_id_for_unit(unit_name)
+            for f in self.cfg.fields:
+                if f.increment:
+                    prev_num_ids[f.name] = str(max_num_id + 1) if max_num_id > 0 else "1"
+
             next_vals = self.cfg.apply_post_record_rules(
-                values, continue_multi_shot_sequence=is_continuation
+                values,
+                continue_multi_shot_sequence=is_continuation,
+                previous_numeric_id_by_field=prev_num_ids,
             )
             self._suppress_unit_hook = True
             try:

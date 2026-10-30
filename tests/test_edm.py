@@ -8,29 +8,41 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+# Ensure modern_edm root is on sys.path regardless of the working directory
+_MODERN_EDM_ROOT = str(Path(__file__).resolve().parent.parent)
+if _MODERN_EDM_ROOT not in sys.path:
+    sys.path.insert(0, _MODERN_EDM_ROOT)
+
 from drivers.total_station import (
+    GeoMaxDriver,
     LeicaAutoTiltDriver,
     LeicaBuilderDriver,
     LeicaGeoCOMDriver,
     LeicaGSIDriver,
     MicroscribeDriver,
+    NikonDriver,
     SerialConfig,
     SokkiaNikonDriver,
     TopconDriver,
     TrimbleM3Driver,
     ZeissRec500Driver,
+    compute_nikon_checksum,
+    compute_sokkia_checksum,
     compute_topcon_bcc,
     compute_topcon_bcc_decimal3,
     create_driver,
     discover_bluetooth_devices,
     parse_transport_endpoint,
     radians_to_dddmmss,
+    wrap_nikon_command,
 )
 from storage.cfg_parser import (
+    generate_alpha_hash_id,
     load_cfg_file,
     parse_cfg_text,
     save_legacy_cfg_file,
@@ -49,14 +61,19 @@ from survey.math_engine import (
     auto_find_unit,
     calc_angle_dddmmss,
     check_point_in_unit,
+    compute_free_station_weighted_svd,
+    compute_helmert_transformation,
+    evaluate_coordinate_math,
     flip_180_dddmmss,
     format_speech_unit_id,
+    helmert_3d_transform,
     initialize_direct,
     initialize_one_point,
     initialize_resection,
     initialize_two_point_backsight,
     reduce_polar_to_cartesian,
     solve_3d_block_georeference,
+    solve_two_shot_setup,
     validate_prism_bounds,
 )
 
@@ -108,7 +125,7 @@ def test_topcon_bcc_and_sokkia_nikon_and_microscribe() -> None:
     assert math.isclose(obs.slope_distance, 12.345, abs_tol=1e-6)
     assert math.isclose(obs.vertical_angle_deg, 90.0, abs_tol=1e-4)
     assert math.isclose(obs.horizontal_angle_deg, 270.5, abs_tol=1e-4)
-    assert drv.format_set_horizontal_angle_cmd(180.0000) == "!HAN18000000\r\n"
+    assert drv.format_set_horizontal_angle_cmd(180.0000) == "J+1800000d060\x03\r\n"
 
     # Verify BCC mismatch raises 'ERROR: BCC mismatch.' (FUN_004c57d0)
     try:
@@ -1300,6 +1317,265 @@ def test_unit_scoped_fields_and_csv_bundle_and_labels(tmp_path: Path) -> None:
     db.close()
 
 
+def test_surf3_edm_parity_checksums_geomax_3d_transforms_carsac_alpha_and_tinydb(tmp_path: Path) -> None:
+    """
+    Comprehensive verification of all newly audited surf3-edm (EDMpy 2.0.0) & edmwin.exe parity items:
+    1. Nikon checksum (test_nikon_bcc.py) & NikonDriver native protocol ('CT\\x02...\\x03', SD/10000.0, Prism vs Reflectorless)
+    2. Sokkia / Nikon (SET) two's complement hex checksum (test_sokkia_checksum.py) & '/Dc <ddd.mmss>,<chk>\\r\\n'
+    3. GeoMaxDriver ('meas/all', 'SET/hz_angle/{rad:10.8f}', gon-to-degree conversion)
+    4. 3D Rodrigues Triangle-Leg + Surface-Normal Alignment (rotate_point on tilted 3D sediment blocks)
+    5. 7-Parameter 3D Helmert Transformation (compute_helmert_transformation & helmert_3d_transform)
+    6. Carsac 2-Shot Triangulation Setup (solve_two_shot_setup) & Weighted 2x2 SVD Free Station (compute_free_station_weighted_svd)
+    7. SpeedButton ID=Alpha 5-character random uppercase hash + preservation of numeric ID sequence + system field preservation on .CFG save
+    8. TinyDB (.json) round-trip export & import (export_edmpy_json / import_edmpy_json) & GeoJSON Suffix_N properties
+    """
+    # 1. Verify Nikon checksum against C:\dev\surf3-edm\src\edmpy\test_nikon_bcc.py
+    nikon_buf = "CT\x02$DNX\x03"
+    assert compute_nikon_checksum(nikon_buf) == chr(0x4A)  # 426 & 0xFF = 170; (170 % 64) + 32 = 42 + 32 = 74 = 0x4A ('J')
+    wrapped_dnx = wrap_nikon_command("$DNX")
+    assert wrapped_dnx == "\x01CT\x02$DNX\x03J\x04\r\n"
+
+    nik_drv = NikonDriver(SerialConfig(port="SIMULATOR", prism_constant_mm=17.0))
+    nik_obs = nik_drv.parse_response("SD+00123456 HA+009030000 VA+009000000\r\n")
+    assert math.isclose(nik_obs.slope_distance, 12.3456, abs_tol=1e-6)
+    assert math.isclose(nik_obs.horizontal_angle_deg, 90.5, abs_tol=1e-4)
+    assert math.isclose(nik_obs.vertical_angle_deg, 90.0, abs_tol=1e-4)
+    lbl_ref = nik_drv.toggle_prism_reflectorless()
+    assert "Reflectorless" in lbl_ref and nik_drv.using_prism is False
+    lbl_prs = nik_drv.toggle_prism_reflectorless()
+    assert "Prism" in lbl_prs and nik_drv.using_prism is True
+
+    # 2. Verify Sokkia checksum against C:\dev\surf3-edm\src\edmpy\test_sokkia_checksum.py
+    assert compute_sokkia_checksum("0002624 0941455 0244103 ") == "88"
+    assert compute_sokkia_checksum("0002624 0941506 0244102 ") == "84"
+    assert compute_sokkia_checksum("0006662 0804806 0394324 ") == "97"
+    nik_set_drv = SokkiaNikonDriver(SerialConfig(port="SIMULATOR"), variant="NIKON_SET")
+    set_angle_cmd = nik_set_drv.format_set_horizontal_angle_cmd(90.3000)
+    assert set_angle_cmd.startswith("/Dc 090.3000,") and set_angle_cmd.endswith("\r\n")
+
+    # 3. Verify GeoMaxDriver gon-to-radian parsing and SetHorizontalAngle
+    gmax_drv = GeoMaxDriver(SerialConfig(port="SIMULATOR"))
+    gmax_obs = gmax_drv.parse_response("15.500,100.0000,100.0000\r\n")  # 100 gon = 90 deg
+    assert math.isclose(gmax_obs.slope_distance, 15.500, abs_tol=1e-6)
+    assert math.isclose(gmax_obs.horizontal_angle_deg, 90.0, abs_tol=1e-4)
+    assert math.isclose(gmax_obs.vertical_angle_deg, 90.0, abs_tol=1e-4)
+    assert gmax_drv.format_set_horizontal_angle_cmd(90.0000).startswith("SET/hz_angle/1.57079633")
+
+    # 4. Verify 3D Rodrigues Triangle-Leg + Surface-Normal Alignment on a tilted 3D block (pitch around X by 90 deg)
+    # Local triangle in X-Y plane rotated 90 deg around X axis into X-Z plane + translated to (100, 200, 30)
+    loc_tri = [Point3D(0.0, 0.0, 0.0), Point3D(1.0, 0.0, 0.0), Point3D(0.0, 1.0, 0.0)]
+    glb_tri = [Point3D(100.0, 200.0, 30.0), Point3D(101.0, 200.0, 30.0), Point3D(100.0, 200.0, 31.0)]
+    q_loc = Point3D(0.5, 0.5, 0.0)
+    q_glb = solve_3d_block_georeference(loc_tri, glb_tri, q_loc)
+    assert math.isclose(q_glb.x, 100.5, abs_tol=1e-5)
+    assert math.isclose(q_glb.y, 200.0, abs_tol=1e-5)
+    assert math.isclose(q_glb.z, 30.5, abs_tol=1e-5)
+
+    # 5. Verify 7-Parameter 3D Helmert Transformation (Levenberg-Marquardt)
+    true_rotator = {
+        "tx": 1000.0,
+        "ty": 2000.0,
+        "tz": 50.0,
+        "omega": math.radians(5.0),
+        "phi": math.radians(-3.0),
+        "kappa": math.radians(12.0),
+        "scale": 1.0,
+    }
+    src_pts = [
+        Point3D(0.0, 0.0, 0.0),
+        Point3D(2.0, 0.0, 0.2),
+        Point3D(0.0, 2.0, -0.1),
+        Point3D(1.5, 1.5, 0.5),
+    ]
+    tgt_pts = [helmert_3d_transform(p, true_rotator, round_digits=None) for p in src_pts]
+    solved_rotator, helmert_errs = compute_helmert_transformation(src_pts, tgt_pts, fix_scale_to_one=True)
+    for err_vec in helmert_errs.values():
+        assert err_vec[3] < 1e-4  # 3D residual < 0.1 mm
+    test_query = Point3D(0.75, 1.25, 0.15)
+    expected_tgt = helmert_3d_transform(test_query, true_rotator, round_digits=3)
+    solved_tgt = helmert_3d_transform(test_query, solved_rotator, round_digits=3)
+    assert (solved_tgt.x, solved_tgt.y, solved_tgt.z) == (expected_tgt.x, expected_tgt.y, expected_tgt.z)
+
+    # 6. Verify Carsac 2-Shot Setup (solve_two_shot_setup) & Weighted 2x2 SVD Free Station
+    # True station at (100, 100, 10), Datum 1 at (100, 110, 10) [due North, dist=10m], Datum 2 at (110, 100, 10) [due East, dist=10m]
+    # Shot 1 taken with Hz=0 -> local (0, 10, 0). Shot 2 is 90 deg clockwise -> local (10, 0, 0).
+    d1_carsac = Datum("D1", 100.0, 110.0, 10.0)
+    d2_carsac = Datum("D2", 110.0, 100.0, 10.0)
+    carsac_stn, foresight_deg, meas_d, act_d, err_d = solve_two_shot_setup(
+        d1_carsac, Point3D(0.0, 10.0, 0.0), d2_carsac, Point3D(10.0, 0.0, 0.0)
+    )
+    assert (carsac_stn.x, carsac_stn.y, carsac_stn.z) == (100.0, 100.0, 10.0)
+    assert math.isclose(foresight_deg, 90.0, abs_tol=1e-4)
+    assert math.isclose(err_d, 0.0, abs_tol=1e-6)
+
+    # Weighted 2x2 SVD Free Station
+    svd_sightings = [
+        ResectionSighting(d1_carsac, slope_distance=10.0, horizontal_angle_rad=0.0, vertical_angle_rad=math.pi / 2.0, prism_height=0.0),
+        ResectionSighting(d2_carsac, slope_distance=10.0, horizontal_angle_rad=math.pi / 2.0, vertical_angle_rad=math.pi / 2.0, prism_height=0.0),
+    ]
+    svd_res, svd_meta = compute_free_station_weighted_svd(svd_sightings, instrument_height=1.50, station_name="SVD_STN")
+    assert math.isclose(svd_res.station.x, 100.0, abs_tol=1e-5)
+    assert math.isclose(svd_res.station.y, 100.0, abs_tol=1e-5)
+    assert math.isclose(svd_res.station.z, 8.5, abs_tol=1e-5)  # optical center 10.0 - HI 1.5 = 8.5
+    assert "D1" in svd_meta["datum_errors"] and svd_meta["datum_errors"]["D1"]["weight_percent"] == 50.0
+
+    # Verify evaluate_coordinate_math (do_coordinate_math)
+    assert math.isclose(evaluate_coordinate_math("100.25 + 0.50"), 100.75, abs_tol=1e-6)
+    assert math.isclose(evaluate_coordinate_math("10.5 - 1.2 * 2"), 8.1, abs_tol=1e-6)
+
+    # 7. Verify SpeedButton ID=Alpha 5-char random hash + numeric ID sequence preservation + system fields on .CFG save
+    cfg_alpha_txt = """
+[EDM]
+Instrument=Leica GeoCom
+COMport=COM1
+Settings=19200,N,8,1
+UNIQUE_TOGETHER=UNIT,ID,SUFFIX
+
+[BUTTON5]
+TITLE=Cailloux
+CODE=Cailloux
+ID=Alpha
+
+[UNIT]
+Type=Menu
+Menu=N100E100,N100E101
+LINKED=ID,SUFFIX,CODE
+Carry=True
+
+[ID]
+Type=Text
+Length=6
+Increment=True
+
+[SUFFIX]
+Type=Numeric
+
+[CODE]
+Type=Menu
+Menu=Silex,Os,Cailloux
+
+[X]
+Type=Numeric
+Required=True
+
+[Y]
+Type=Numeric
+Required=True
+
+[Z]
+Type=Numeric
+Required=True
+"""
+    cfg_a = parse_cfg_text(cfg_alpha_txt)
+    assert len(cfg_a.system_fields) == 3  # [X], [Y], [Z] preserved in system_fields!
+    assert "ID" in cfg_a.get_unit_scoped_field_names()  # populated from [UNIT] LINKED=
+    applied_a = cfg_a.apply_button_macro(
+        cfg_a.button_macros[0],
+        {"UNIT": "N100E100", "ID": "14", "SUFFIX": "0", "CODE": "Silex"},
+    )
+    assert applied_a["CODE"] == "Cailloux"
+    assert len(applied_a["ID"]) == 5 and applied_a["ID"].isalpha() and applied_a["ID"].isupper()
+
+    # Post-record after an Alpha shot must resume the numeric ID sequence (14 -> 15) rather than resetting to 1
+    next_after_alpha = cfg_a.apply_post_record_rules(
+        applied_a,
+        continue_multi_shot_sequence=False,
+        previous_numeric_id_by_field={"ID": "15"},
+    )
+    assert next_after_alpha["ID"] == "15"
+
+    # Saving the .CFG must preserve [X], [Y], [Z], LINKED=, and UNIQUE_TOGETHER=
+    saved_a_path = tmp_path / "alpha_roundtrip.cfg"
+    save_legacy_cfg_file(cfg_a, saved_a_path)
+    saved_a_text = saved_a_path.read_text(encoding="utf-8")
+    assert "[X]" in saved_a_text and "[Y]" in saved_a_text and "[Z]" in saved_a_text
+    assert "LINKED=ID,SUFFIX,CODE" in saved_a_text
+    assert "UNIQUE_TOGETHER=UNIT,ID,SUFFIX" in saved_a_text
+
+    # 8. Verify TinyDB (.json) round-trip export & import + GeoJSON Suffix_N properties + Z adjustment on prism edit
+    db1 = EDMDatabase(tmp_path / "tinydb_src.sqlite")
+    stn1 = db1.load_station_state()
+    p_mini = Prism("Mini", 0.10, 0.0)
+    doc1 = db1.record_point("N100E100", "1", 0, 100.5, 100.6, 9.90, p_mini, 2.0, 45.0, 90.0, stn1, {"CODE": "Silex"})
+    doc2 = db1.record_point("N100E100", "1", 1, 100.7, 100.8, 9.85, p_mini, 2.1, 48.0, 90.0, stn1, {"CODE": "Silex"})
+
+    # Editing PRISM_HT from 0.10m to 1.10m (+1.00m taller pole) must adjust Z by -1.00m (9.90 -> 8.90)
+    db1.update_point_cell(doc1, "PRISM_HT", "1.100", auto_adjust_z_on_prism_change=True)
+    updated_p1 = db1.list_points()[0]
+    assert math.isclose(updated_p1["z"], 8.90, abs_tol=1e-5)
+
+    # Export GeoJSON and verify Suffix_0 and Suffix_1 properties on LineString feature
+    geojson_out = db1.export_geojson(tmp_path / "series_line.geojson")
+    line_feats = [f for f in geojson_out["features"] if f["geometry"]["type"] == "LineString"]
+    assert len(line_feats) == 1
+    assert "Suffix_0" in line_feats[0]["properties"] and "Suffix_1" in line_feats[0]["properties"]
+
+    # Export to surf3-edm TinyDB .json and import into a fresh SQLite DB
+    tinydb_path = tmp_path / "edmpy_export.json"
+    db1.export_edmpy_json(tinydb_path, table_name="test_site")
+    db1.close()
+
+    db2 = EDMDatabase(tmp_path / "tinydb_dst.sqlite")
+    imp_counts = db2.import_edmpy_json(tinydb_path, table_name_hint="test_site")
+    assert imp_counts["points"] == 2
+    assert imp_counts["datums"] >= 3
+    assert imp_counts["prisms"] >= 3
+    assert imp_counts["units"] >= 1
+    db2_pts = db2.list_points()
+    assert len(db2_pts) == 2
+    assert math.isclose(db2_pts[0]["z"], 8.90, abs_tol=1e-5)
+    db2.close()
+
+    # 9. Verify real-world .CFG round-trip and example dataset imports from C:\dev\surf3-edm if present
+    surf3_root = Path(r"C:\dev\surf3-edm")
+    if surf3_root.is_dir():
+        from storage.legacy_migrator import (
+            _read_csv_rows,
+            import_datums_rows,
+            import_points_rows,
+            import_prisms_rows,
+            import_units_rows,
+        )
+        cfg_files = [
+            p for p in surf3_root.rglob("*")
+            if p.suffix.lower() == ".cfg" and p.stat().st_size > 0
+        ]
+        assert len(cfg_files) >= 30
+        rt_dir = tmp_path / "surf3_cfgs"
+        rt_dir.mkdir(parents=True, exist_ok=True)
+        for p in cfg_files:
+            loaded_c = load_cfg_file(p)
+            out_c = rt_dir / p.name
+            save_legacy_cfg_file(loaded_c, out_c)
+            reloaded_c = load_cfg_file(out_c)
+            assert len(reloaded_c.all_cfg_fields()) == len(loaded_c.all_cfg_fields())
+
+        ex_mob = surf3_root / "Import_from_EDM-Mobile" / "examples"
+        if ex_mob.is_dir():
+            db_bk = EDMDatabase(tmp_path / "bk_real.sqlite")
+            assert import_datums_rows(db_bk, _read_csv_rows(ex_mob / "bk_datums.txt")) == 23
+            assert import_prisms_rows(db_bk, _read_csv_rows(ex_mob / "bk_prisms.txt")) == 6
+            assert import_units_rows(db_bk, _read_csv_rows(ex_mob / "bk_units.txt"))[0] == 65
+            assert import_points_rows(db_bk, _read_csv_rows(ex_mob / "bk_points.txt")) == 32
+            db_bk.close()
+
+            db_rn = EDMDatabase(tmp_path / "ranis_real.sqlite")
+            assert import_datums_rows(db_rn, _read_csv_rows(ex_mob / "ranis_datums.txt")) == 26
+            assert import_prisms_rows(db_rn, _read_csv_rows(ex_mob / "ranis_prisms.txt")) == 12
+            assert import_units_rows(db_rn, _read_csv_rows(ex_mob / "ranis_units.txt"))[0] == 7
+            assert import_points_rows(db_rn, _read_csv_rows(ex_mob / "ranis_points.txt")) == 5
+            db_rn.close()
+
+        ex_win = surf3_root / "Import_from_EDMWin" / "examples"
+        if ex_win.is_dir():
+            db_win = EDMDatabase(tmp_path / "edmwin_real.sqlite")
+            assert import_datums_rows(db_win, _read_csv_rows(ex_win / "datums.csv")) == 11
+            assert import_prisms_rows(db_win, _read_csv_rows(ex_win / "prisms.csv")) == 12
+            assert import_units_rows(db_win, _read_csv_rows(ex_win / "units.csv"))[0] == 153
+            assert import_points_rows(db_win, _read_csv_rows(ex_win / "points.csv")) == 100
+            db_win.close()
+
+
 class TestEDMUnittestWrapper(unittest.TestCase):
     def test_all_protocols_and_math_and_ui_parity(self) -> None:
         import gc
@@ -1328,6 +1604,7 @@ class TestEDMUnittestWrapper(unittest.TestCase):
             test_label_printer_and_help_viewer_dialogs_offscreen(tmp_p)
             test_legacy_csv_bundle_and_mdb_migration_offscreen(tmp_p)
             test_cloud_sync_and_email_share_offscreen(tmp_p)
+            test_surf3_edm_parity_checksums_geomax_3d_transforms_carsac_alpha_and_tinydb(tmp_p)
         finally:
             app = QApplication.instance()
             if app is not None:

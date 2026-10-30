@@ -1999,6 +1999,17 @@ class DataGridDialog(QDialog):
         new_val = item.text().strip()
 
         try:
+            # Support inline arithmetic expressions (surf3-edm do_coordinate_math) in coordinate/prism cells
+            if col_name.upper() in ("X", "Y", "Z", "PRISM_HT", "SLOPED", "HANGLE", "VANGLE"):
+                from survey.math_engine import evaluate_coordinate_math
+                eval_val = evaluate_coordinate_math(new_val)
+                new_val = f"{eval_val:.4f}" if col_name.upper() != "PRISM_HT" else f"{eval_val:.3f}"
+                self._suppress_cell_signal = True
+                try:
+                    item.setText(new_val)
+                finally:
+                    self._suppress_cell_signal = False
+
             # Validate numeric columns before committing
             for f in self.cfg.fields:
                 if f.name.upper() == col_name.upper() and f.field_type.upper() in ("NUMERIC", "INTEGER"):
@@ -2007,6 +2018,8 @@ class DataGridDialog(QDialog):
                 float(new_val)
 
             self.db.update_point_cell(int(doc_id), col_name, new_val)
+            if col_name.upper() in ("PRISM", "PRISM_NAME", "PRISM_HT", "PRISM_HEIGHT"):
+                self.reload_grid()
         except ValueError as exc:
             QMessageBox.warning(
                 self,

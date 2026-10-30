@@ -1,12 +1,17 @@
 """
-Crash-Safe Atomic SQLite Storage, Duplicate ID Resolver, Series Resequencer & CSV / GeoJSON Exporters.
-Replicates all database behaviors from decompiled edmwin.exe:
+Crash-Safe Atomic SQLite Storage, Duplicate ID Resolver, Series Resequencer,
+TinyDB (.json) Serializer & CSV / GeoJSON Exporters.
+Replicates all database behaviors from decompiled edmwin.exe & surf3-edm (EDMpy 2.0.0):
 - Lookup Last ID per unit (0x0042d2cc / 0x004339d4: numeric IDs where id < 'A')
 - Duplicate ID detection & frmDupID 3-way resolution (Convert to alpha ID, New ID, Continuation +Shot)
 - Multi-shot series initial-record verification (0x0042c274)
 - Multi-shot series deletion & automatic SUFFIX resequencing (FUN_00489a60)
-- Unit-scoped field state persistence (EDM_Units carryover fields)
+- Unit-scoped & Linked field state persistence (EDM_Units carryover fields & arbitrary LINKED= fields)
+- Auto-populated system fields: DATUMNAME, DATUMX/Y/Z, STATIONX/Y/Z, LOCALX/Y/Z, PRISM, HANGLE/VANGLE (DDD.MMSS), SLOPED, DATE
+- Consecutive duplicate XYZ detection (check_for_duplicate_xyz)
+- Automatic Z recalculation on Prism height edit (Z_new = Z_old + h_old - h_new)
 - 4-Table Legacy EDMWin CSV Bundle Export (_points.csv, _datums.csv, _prisms.csv, _units.csv)
+- surf3-edm TinyDB (.json) Import & Export + Suffix_N GeoJSON Exporter
 """
 
 from __future__ import annotations
@@ -14,11 +19,13 @@ from __future__ import annotations
 import csv
 import datetime
 import json
+import math
 import sqlite3
 import string
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from drivers.total_station import radians_to_dddmmss
 from survey.math_engine import Datum, ExcavationUnit, Prism, StationState
 
 
@@ -345,6 +352,23 @@ class EDMDatabase:
         ).fetchone()
         return bool(row and int(row["cnt"]) > 0)
 
+    def check_last_two_points_duplicate_xyz(self) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """
+        Replicates check_for_duplicate_xyz in surf3-edm (e5_widgets.py:1174):
+        Returns (prev_point, last_point) if the last two recorded shots have identical (X, Y, Z).
+        """
+        pts = self.list_points()
+        if len(pts) < 2:
+            return None
+        prev_p, last_p = pts[-2], pts[-1]
+        if (
+            math.isclose(float(last_p["x"]), float(prev_p["x"]), abs_tol=1e-6)
+            and math.isclose(float(last_p["y"]), float(prev_p["y"]), abs_tol=1e-6)
+            and math.isclose(float(last_p["z"]), float(prev_p["z"]), abs_tol=1e-6)
+        ):
+            return prev_p, last_p
+        return None
+
     def resolve_duplicate_id(self, unit: str, point_id: str, option: str) -> Tuple[str, int]:
         """
         Replicates frmDupID (0x004399e8):
@@ -390,8 +414,7 @@ class EDMDatabase:
         Replicates FUN_00489a60 (DeleteRecord in edmwin.exe):
         - If delete_entire_series is True, deletes all records matching (unit, id).
         - If delete_entire_series is False, deletes the specified doc_id and resequences
-          all subsequent shots in the same (unit, id) series by decrementing suffix by 1
-          ('Resequencing subsequent shot(s) from ... as continuation shots for ...').
+          all subsequent shots in the same (unit, id) series by decrementing suffix by 1.
         """
         target = self.conn.execute(
             "SELECT * FROM points WHERE doc_id = ?;", (doc_id,)
@@ -463,11 +486,29 @@ class EDMDatabase:
     ) -> int:
         ts = timestamp or datetime.datetime.now().isoformat(timespec="seconds")
         enriched_extra = dict(extra_fields)
+        stn_z_ctr = station.instrument_center_z
+        local_x = x - station.x
+        local_y = y - station.y
+        local_z = z - stn_z_ctr
+
+        h_dddmmss = radians_to_dddmmss(math.radians(h_angle_deg))
+        v_dddmmss = radians_to_dddmmss(math.radians(v_angle_deg))
+
         enriched_extra.setdefault("DATUMNAME", station.station_name)
         enriched_extra.setdefault("DATUMX", f"{station.x:.3f}")
         enriched_extra.setdefault("DATUMY", f"{station.y:.3f}")
-        enriched_extra.setdefault("DATUMZ", f"{station.instrument_center_z:.3f}")
+        enriched_extra.setdefault("DATUMZ", f"{stn_z_ctr:.3f}")
+        enriched_extra.setdefault("STATIONX", f"{station.x:.3f}")
+        enriched_extra.setdefault("STATIONY", f"{station.y:.3f}")
+        enriched_extra.setdefault("STATIONZ", f"{stn_z_ctr:.3f}")
+        enriched_extra.setdefault("LOCALX", f"{local_x:.3f}")
+        enriched_extra.setdefault("LOCALY", f"{local_y:.3f}")
+        enriched_extra.setdefault("LOCALZ", f"{local_z:.3f}")
         enriched_extra.setdefault("PRISM", prism.name)
+        enriched_extra.setdefault("SLOPED", f"{slope_dist:.3f}")
+        enriched_extra.setdefault("HANGLE", f"{h_dddmmss:.4f}")
+        enriched_extra.setdefault("VANGLE", f"{v_dddmmss:.4f}")
+        enriched_extra.setdefault("DATE", ts.replace("T", " "))
 
         with self.conn:
             cur = self.conn.execute(
@@ -496,7 +537,7 @@ class EDMDatabase:
                     v_angle_deg,
                     station.x,
                     station.y,
-                    station.instrument_center_z,
+                    stn_z_ctr,
                     ts,
                     json.dumps(enriched_extra),
                 ),
@@ -518,10 +559,6 @@ class EDMDatabase:
         return pts[-1] if pts else None
 
     def get_distinct_field_values(self, field_name: str) -> List[str]:
-        """
-        Replicates 'select distinct [<field>] from [<PointTable>]' in frmFilter (0x00437f9c):
-        Returns sorted distinct non-empty string representations for any core column or custom .CFG field.
-        """
         fname_upper = field_name.strip().upper()
         core_map = {
             "RECNO": "doc_id",
@@ -573,10 +610,6 @@ class EDMDatabase:
         field_value: Optional[str] = None,
         station_xyz: Optional[Tuple[float, float, float]] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Filters recorded points by (field_name == field_value) and/or by Current Station coordinates
-        (replicating mnuFilter 'Show only Points from Current Station' @ 0x0041103a and frmFilter @ 0x00439638).
-        """
         pts = self.list_points()
         if station_xyz is not None:
             sx, sy, sz = station_xyz
@@ -613,7 +646,9 @@ class EDMDatabase:
 
         filtered: List[Dict[str, Any]] = []
         for p in pts:
-            if fname_upper in core_map:
+            if fname_upper == "UNIT-ID":
+                s = f"{str(p.get('unit', '')).strip()}-{str(p.get('id', '')).strip()}"
+            elif fname_upper in core_map:
                 raw = p.get(core_map[fname_upper], "")
                 s = f"{raw:.4f}" if isinstance(raw, float) else str(raw).strip()
             else:
@@ -627,10 +662,17 @@ class EDMDatabase:
                 filtered.append(p)
         return filtered
 
-    def update_point_cell(self, doc_id: int, column_name: str, new_value: Any) -> None:
+    def update_point_cell(
+        self,
+        doc_id: int,
+        column_name: str,
+        new_value: Any,
+        auto_adjust_z_on_prism_change: bool = True,
+    ) -> None:
         """
         Inline-updates any core column or custom .CFG extra field for a given point record
-        (replicating MSDataGrid inline cell editing on frmDataGrid @ 0x0043b8f4).
+        (replicating MSDataGrid inline cell editing on frmDataGrid @ 0x0043b8f4 &
+        surf3-edm check_for_prism_change / offer_to_adjust_z @ e5_widgets.py:1066).
         """
         target = self.conn.execute(
             "SELECT * FROM points WHERE doc_id = ?;", (doc_id,)
@@ -673,16 +715,43 @@ class EDMDatabase:
             elif col_upper in ("PRISM", "PRISM_NAME"):
                 val_str = str(new_value).strip()
                 extra["PRISM"] = val_str
-                self.conn.execute(
-                    "UPDATE points SET prism_name = ?, extra_fields_json = ? WHERE doc_id = ?;",
-                    (val_str, json.dumps(extra), doc_id),
-                )
+                # If new_value matches a defined Prism name (or numeric height), optionally adjust Z
+                old_ph = float(target["prism_height"])
+                new_ph: Optional[float] = None
+                for pr in self.list_prisms():
+                    if pr.name.upper() == val_str.upper():
+                        new_ph = pr.height
+                        break
+                if new_ph is None:
+                    try:
+                        new_ph = float(val_str)
+                    except ValueError:
+                        pass
+                if new_ph is not None and auto_adjust_z_on_prism_change:
+                    new_z = float(target["z"]) + old_ph - new_ph
+                    self.conn.execute(
+                        "UPDATE points SET prism_name = ?, prism_height = ?, z = ?, extra_fields_json = ? WHERE doc_id = ?;",
+                        (val_str, new_ph, new_z, json.dumps(extra), doc_id),
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE points SET prism_name = ?, extra_fields_json = ? WHERE doc_id = ?;",
+                        (val_str, json.dumps(extra), doc_id),
+                    )
             elif col_upper in ("PRISM_HT", "PRISM_HEIGHT"):
-                f_val = float(str(new_value).strip())
-                self.conn.execute(
-                    "UPDATE points SET prism_height = ? WHERE doc_id = ?;",
-                    (f_val, doc_id),
-                )
+                new_ph = float(str(new_value).strip())
+                old_ph = float(target["prism_height"])
+                if auto_adjust_z_on_prism_change:
+                    new_z = float(target["z"]) + old_ph - new_ph
+                    self.conn.execute(
+                        "UPDATE points SET prism_height = ?, z = ? WHERE doc_id = ?;",
+                        (new_ph, new_z, doc_id),
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE points SET prism_height = ? WHERE doc_id = ?;",
+                        (new_ph, doc_id),
+                    )
             elif col_upper in ("SLOPED", "SLOPE_DIST"):
                 f_val = float(str(new_value).strip())
                 self.conn.execute(
@@ -753,7 +822,7 @@ class EDMDatabase:
             "doc_id", "UNIT", "ID", "SUFFIX", "X", "Y", "Z",
             "PRISM", "PRISM_HT", "SLOPE_DIST", "H_ANGLE", "V_ANGLE", "TIMESTAMP"
         ]
-        headers = base_headers + extra_field_names
+        headers = base_headers + [k for k in extra_field_names if k not in base_headers]
 
         with Path(csv_path).open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=headers)
@@ -775,7 +844,8 @@ class EDMDatabase:
                     "TIMESTAMP": p["timestamp"],
                 }
                 for k in extra_field_names:
-                    row_dict[k] = p["extra_fields"].get(k, "")
+                    if k not in row_dict:
+                        row_dict[k] = p["extra_fields"].get(k, "")
                 writer.writerow(row_dict)
 
     def import_points_csv(self, csv_path: str | Path) -> int:
@@ -813,11 +883,18 @@ class EDMDatabase:
         return count
 
     def export_geojson(self, output_path: str | Path) -> Dict[str, Any]:
+        """
+        Exports a 3D GeoJSON FeatureCollection with both:
+        - Point features & LineString features (with surf3-edm Suffix_0, Suffix_1 nested vertex properties!).
+        """
         pts = self.list_points()
         features: List[Dict[str, Any]] = []
         grouped_sequences: Dict[str, List[Dict[str, Any]]] = {}
 
         for p in pts:
+            seq_key = f"{p['unit']}-{p['id']}"
+            grouped_sequences.setdefault(seq_key, []).append(p)
+
             props = {
                 "doc_id": p["doc_id"],
                 "UNIT": p["unit"],
@@ -838,8 +915,6 @@ class EDMDatabase:
                     "properties": props,
                 }
             )
-            seq_key = f"{p['unit']}::{p['id']}"
-            grouped_sequences.setdefault(seq_key, []).append(p)
 
         for seq_key, group in grouped_sequences.items():
             if len(group) >= 2:
@@ -849,6 +924,24 @@ class EDMDatabase:
                     for g in sorted_grp
                 ]
                 first = sorted_grp[0]
+                line_props: Dict[str, Any] = {
+                    "layer_type": "MultiShotLine",
+                    "UNIT": first["unit"],
+                    "ID": first["id"],
+                    "shot_count": len(sorted_grp),
+                    **first["extra_fields"],
+                }
+                for g in sorted_grp:
+                    suf_idx = int(g["suffix"])
+                    line_props[f"Suffix_{suf_idx}"] = {
+                        "X": round(g["x"], 4),
+                        "Y": round(g["y"], 4),
+                        "Z": round(g["z"], 4),
+                        "SLOPED": round(g["slope_dist"], 4),
+                        "HANGLE": g["extra_fields"].get("HANGLE", f"{g['h_angle_deg']:.4f}"),
+                        "VANGLE": g["extra_fields"].get("VANGLE", f"{g['v_angle_deg']:.4f}"),
+                        "DATE": g["timestamp"],
+                    }
                 features.append(
                     {
                         "type": "Feature",
@@ -856,23 +949,122 @@ class EDMDatabase:
                             "type": "LineString",
                             "coordinates": coords,
                         },
-                        "properties": {
-                            "layer_type": "MultiShotLine",
-                            "UNIT": first["unit"],
-                            "ID": first["id"],
-                            "shot_count": len(sorted_grp),
-                            **first["extra_fields"],
-                        },
+                        "properties": line_props,
                     }
                 )
 
         collection = {
             "type": "FeatureCollection",
-            "name": "EDM_Excavation_Export",
+            "name": Path(output_path).stem or "EDM_Excavation_Export",
             "features": features,
         }
         Path(output_path).write_text(json.dumps(collection, indent=2), encoding="utf-8")
         return collection
+
+    # --- surf3-edm (EDMpy 2.0.0) TinyDB .json Export & Import Parity ---
+    def export_edmpy_json(self, json_path: str | Path, table_name: str = "_default") -> Dict[str, Any]:
+        """
+        Exports the entire SQLite project (points, datums, prisms, units) into a surf3-edm
+        compatible TinyDB .json file (sort_keys=True, indent=4, separators=(',', ': ')).
+        """
+        tname = table_name.strip() or "_default"
+        payload: Dict[str, Dict[str, Any]] = {
+            tname: {},
+            "datums": {},
+            "prisms": {},
+            "units": {},
+        }
+        for idx, d in enumerate(self.list_datums(), start=1):
+            payload["datums"][str(idx)] = {
+                "NAME": d.name,
+                "X": str(round(d.x, 3)),
+                "Y": str(round(d.y, 3)),
+                "Z": str(round(d.z, 3)),
+                "NOTES": d.description,
+            }
+        for idx, pr in enumerate(self.list_prisms(), start=1):
+            payload["prisms"][str(idx)] = {
+                "NAME": pr.name,
+                "HEIGHT": round(pr.height, 3),
+                "OFFSET": round(pr.offset, 3),
+            }
+        for idx, u in enumerate(self.list_units(), start=1):
+            payload["units"][str(idx)] = {
+                "NAME": u.name,
+                "MINX": round(u.min_x, 3),
+                "MINY": round(u.min_y, 3),
+                "MAXX": round(u.max_x, 3),
+                "MAXY": round(u.max_y, 3),
+                "CENTERX": round(u.center_x, 3),
+                "CENTERY": round(u.center_y, 3),
+                "RADIUS": str(round(u.radius, 3)) if u.radius else "",
+            }
+        for p in self.list_points():
+            doc_key = str(p["doc_id"])
+            rec: Dict[str, Any] = dict(p.get("extra_fields", {}))
+            rec.update({
+                "UNIT": p["unit"],
+                "ID": str(p["id"]),
+                "SUFFIX": int(p["suffix"]),
+                "X": round(float(p["x"]), 3),
+                "Y": round(float(p["y"]), 3),
+                "Z": round(float(p["z"]), 3),
+                "PRISM": round(float(p["prism_height"]), 3),
+                "SLOPED": round(float(p["slope_dist"]), 3),
+                "HANGLE": rec.get("HANGLE", f"{float(p['h_angle_deg']):.4f}"),
+                "VANGLE": rec.get("VANGLE", f"{float(p['v_angle_deg']):.4f}"),
+                "STATIONX": round(float(p["station_x"]), 3),
+                "STATIONY": round(float(p["station_y"]), 3),
+                "STATIONZ": round(float(p["station_z"]), 3),
+                "LOCALX": round(float(p["x"]) - float(p["station_x"]), 3),
+                "LOCALY": round(float(p["y"]) - float(p["station_y"]), 3),
+                "LOCALZ": round(float(p["z"]) - float(p["station_z"]), 3),
+                "DATE": p["timestamp"],
+            })
+            payload[tname][doc_key] = rec
+
+        Path(json_path).write_text(
+            json.dumps(payload, sort_keys=True, indent=4, separators=(",", ": ")),
+            encoding="utf-8",
+        )
+        return payload
+
+    def import_edmpy_json(self, json_path: str | Path, table_name_hint: str = "") -> Dict[str, int]:
+        """
+        Imports points, datums, prisms, and units from a surf3-edm TinyDB .json file.
+        """
+        from storage.legacy_migrator import (
+            import_datums_rows,
+            import_points_rows,
+            import_prisms_rows,
+            import_units_rows,
+            rebuild_unit_field_states_from_points,
+        )
+        raw = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        counts = {"datums": 0, "prisms": 0, "units": 0, "points": 0, "unit_states": 0}
+        if not isinstance(raw, dict):
+            return counts
+
+        if "datums" in raw and isinstance(raw["datums"], dict):
+            counts["datums"] = import_datums_rows(self, raw["datums"].values())
+        if "prisms" in raw and isinstance(raw["prisms"], dict):
+            counts["prisms"] = import_prisms_rows(self, raw["prisms"].values())
+        if "units" in raw and isinstance(raw["units"], dict):
+            u_c, _ = import_units_rows(self, raw["units"].values())
+            counts["units"] = u_c
+
+        reserved_tables = {"datums", "prisms", "units"}
+        for tname, tdict in raw.items():
+            if tname.lower() in reserved_tables or not isinstance(tdict, dict):
+                continue
+            if table_name_hint and tname.lower() != table_name_hint.lower():
+                continue
+            rows = [r for r in tdict.values() if isinstance(r, dict) and ("X" in r or "x" in r)]
+            if rows:
+                counts["points"] += import_points_rows(self, rows)
+
+        counts["unit_states"] = rebuild_unit_field_states_from_points(self)
+        return counts
 
     # --- Unit-Scoped Field State (EDMWin / EDMCE UnitFields Parity) ---
     def save_unit_field_state(self, unit_name: str, state_dict: Dict[str, Any]) -> None:
@@ -899,14 +1091,6 @@ class EDMDatabase:
 
     # --- Full 4-Table Legacy EDMWin v3.3 ASCII / CSV Bundle Export & Import ---
     def export_edmwin_csv_bundle(self, root_path: str | Path) -> Dict[str, str]:
-        """
-        Matches EDMWin's 'File -> Export CSVs' (frmExport_CSVs @ 0x0043ab48) which takes
-        a folder and file prefix and appends _points, _prisms, _units, _datums:
-          - <prefix>_points.csv
-          - <prefix>_datums.csv
-          - <prefix>_prisms.csv
-          - <prefix>_units.csv
-        """
         root = Path(root_path)
         stem = root.stem
         parent = root.parent
@@ -948,10 +1132,6 @@ class EDMDatabase:
         }
 
     def import_edmwin_csv_bundle(self, path_or_prefix: str | Path) -> Dict[str, int]:
-        """
-        Imports an EDMWin 4-table CSV bundle (_points.csv, _datums.csv, _prisms.csv, _units.csv)
-        and rebuilds unit-scoped field state.
-        """
         from storage.legacy_migrator import import_edmwin_csv_bundle as _imp_bundle
         rep = _imp_bundle(self, path_or_prefix)
         return {
@@ -963,10 +1143,6 @@ class EDMDatabase:
         }
 
     def import_edmwin_mdb(self, mdb_path: str | Path, points_table_hint: str = "") -> Dict[str, int]:
-        """
-        Imports all Datums, Prisms, Units, and Points from a legacy EDMWin Microsoft Access (.mdb)
-        file into this SQLite database and rebuilds unit-scoped field state.
-        """
         from storage.legacy_migrator import import_edmwin_mdb as _imp_mdb
         rep = _imp_mdb(self, mdb_path, points_table_hint=points_table_hint)
         return {

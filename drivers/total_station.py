@@ -2,27 +2,25 @@
 Hardware, Serial, Bluetooth (RFCOMM / SPP / BLE UART), Wi-Fi / Ethernet TCP/IP,
 UDP Stream, and Multi-Protocol Virtual Emulator Drivers for Modern EDM.
 
-Supports all 12 instrument protocols:
-1. LeicaGeoCOMDriver (WILD2 / LEICA GeoCOM ASCII RPC - TPS1000/1100/1200, Viva TS11-16, Nova MS50/60)
+Supports all 14 instrument protocols (100% parity with edmwin.exe & surf3-edm 2.0.0):
+1. LeicaGeoCOMDriver (WILD2 / LEICA GeoCOM ASCII RPC - TPS1000/1100/1200, Viva TS11-16, Nova MS50/60,
+   including TMC_CLEAR 2008:3,1, fetch_hangle 2107:1, Prism/Reflectorless toggle 17021/17022,
+   prism constant 2023, atmosphere 2029/2151, station coordinate upload 2009/2010, and error codes 1283..1383)
 2. LeicaAutoTiltDriver (LEICA_AUTOTILT 11-step motorized GeoCOM lock & tilt compensation)
-3. LeicaGSIDriver (WILD / LEICA GSI-8 & GSI-16 - TC400-TC2000, TCR300-800)
+3. LeicaGSIDriver (WILD / LEICA GSI-8 & GSI-16 - TC400-TC2000, TCR300-800, WI51 prism constant)
 4. LeicaBuilderDriver (BUILDER - Leica Builder 100-500 / iCON '$MSR' / '/Dc ')
-5. TopconDriver (TOPCON GTS-3, 210, 220, 301-303, 320, GM/GT/OS with BCC checksum & barrel-reversal checks)
-6. SokkiaDriver & NikonDriver (SOKKIA SET / CX / SX / iX '$DNX' / DC1 0x11 & NIKON DTM / NPL / Nivo '!HAN' with DC2 0x12 abort)
-7. TrimbleM3Driver (TRIMBLE / GEODIMETER GDS / M3 / 5600 / S-Series 'RG=1' / Label 37=Hz, 38=V, 39=SD)
-8. ZeissRec500Driver (ZEISS Elta / REC-500 ASCII angle/distance frames)
-9. MicroscribeDriver (MICROSCRIBE / PENTOGRAPH 'GETPOS' & Clipboard mm-to-m parser)
-10. ManualDriver (MANUAL / NONE hand-entered V/Hz/SD or X/Y/Z)
-11. SimulatorDriver (SIMULATE offline synthetic coordinate generator)
-
-Supports 6 Physical & Virtual Transport Mechanisms:
-- RS-232 / USB-Serial UART (`COM1`..`COM256`, `/dev/ttyUSB*`, `/dev/cu.usbserial*`)
-- Bluetooth Classic SPP / Virtual COM (`Standard Serial over Bluetooth link`, `/dev/cu.Bluetooth*`)
-- Direct Bluetooth RFCOMM Socket (`bt://AA:BB:CC:DD:EE:FF:1` or `rfcomm://AA:BB:CC:DD:EE:FF:1` via Python `socket.AF_BLUETOOTH`)
-- Bluetooth Low Energy (BLE) GATT Nordic UART (`ble://AA:BB:CC:DD:EE:FF` or device name via `bleak` when available)
-- Wi-Fi / Ethernet TCP/IP Socket (`tcp://192.168.1.100:5000` or `socket://host:port` for robotic Wi-Fi bridges, NPort, & pyserial RFC2217)
-- UDP Datagram Bridge (`udp://127.0.0.1:5005`)
-- Multi-Protocol Virtual Hardware Emulators (`SIMULATOR`, `VIRT-LEICA`, `VIRT-TOPCON`, `VIRT-SOKKIA`, `VIRT-TRIMBLE`, `VIRT-MICROSCRIBE`, `BT-SIM-LEICA`, `TCP-SIM-STATION`)
+5. GeoMaxDriver (GEOMAX - 'SET/distance_unit/0', 'SET/angle_unit/1', 'meas/all', 'SET/hz_angle/{rad}')
+6. TopconDriver (TOPCON GTS-3, 210, 220, 301-303, 320, GM/GT/OS with hex & 3-digit decimal BCC,
+   'J+<angle>d<BCC>' set H-angle, ACK '\\x06006\\x03\\r\\n', 'L' fetch H-angle, and [43:48] prism offset)
+7. NikonDriver (NIKON DTM / NPL / Nivo native SOH + 'CT\\x02<CMD>\\x03<BCC>\\x04\\r\\n' protocol:
+   '$DNX', '$MSR', '!HAN', '?HAN', '!TGTP'/'!TGTN' Prism vs Reflectorless, '!PSM'/'?PSM' prism constant,
+   '?CND' settings, and 'SD... HA... VA...' parser dividing SD by 10000.0)
+8. SokkiaNikonDriver (SOKKIA & NIKON (SET) mode: DC1 0x11 trigger, DC2 0x12 abort, and
+   '/Dc <ddd.mmss>,<SokkiaChecksum>\\r\\n' two's complement hex checksum)
+9. TrimbleM3Driver (TRIMBLE / GEODIMETER GDS / M3 / 5600 / S-Series 'RG=1' / Label 37=Hz, 38=V, 39=SD)
+10. ZeissRec500Driver (ZEISS Elta / REC-500 ASCII angle/distance frames)
+11. MicroscribeDriver (MICROSCRIBE / PENTOGRAPH 'GETPOS' & Clipboard mm-to-m parser)
+12. ManualDriver / SimulatorDriver (MANUAL / SIMULATE offline synthetic coordinate generator)
 """
 
 from __future__ import annotations
@@ -46,13 +44,32 @@ except ImportError:
     HAS_PYSERIAL = False
 
 
+LEICA_GEOCOM_ERRORS: Dict[int, str] = {
+    0: "",
+    1283: "Warning: measurement without full correction. Check leveling the station.",
+    1284: "Info: accuracy can not be guaranteed",
+    1285: "Warning: only angle measurement valid",
+    1288: "Warning: only angle measurement valid but without full correction",
+    1289: "Info: only angle measurement valid but accuracy can not be guaranteed",
+    1290: "Error: no angle measurement",
+    1291: "Error: wrong setting of PPM or MM on EDM",
+    1292: "Error: distance measurement not done (no aim, etc.)",
+    1293: "Error: system is busy (no measurement done)",
+    1294: "Error: no signal on EDM (only in signal mode)",
+    1380: "Warning: inclination out of time range",
+    1381: "Warning: measurement without plane inclination correction",
+    1382: "Warning: measurement without sensor inclination correction",
+    1383: "Info: inclination accuracy can not be guaranteed",
+}
+
+
 @dataclass(frozen=True)
 class RawObservation:
     """Standardized observation returned by any Total Station driver."""
     slope_distance: float           # Meters (offset +0x0C in edmwin.exe)
     horizontal_angle_rad: float     # Radians [0, 2*pi) (offset +0x10 in edmwin.exe)
     vertical_angle_rad: float       # Radians Zenith angle (offset +0x14 in edmwin.exe)
-    tilt_compensation: float = 0.0  # Cross/length tilt compensation (offset +0x18 / +0x20)
+    tilt_compensation: float = 0.0  # Cross/length tilt compensation or prism constant (offset +0x18 / +0x20)
     direct_xyz: Optional[Tuple[float, float, float]] = None  # Used by Microscribe or Manual XYZ mode
     raw_tx: str = ""
     raw_rx: str = ""
@@ -76,16 +93,6 @@ class RawObservation:
 
 @dataclass
 class SerialConfig:
-    """
-    Unified transport & serial configuration.
-    `port` accepts:
-      - Standard OS COM/tty ports: 'COM1', '/dev/ttyUSB0', '/dev/cu.Bluetooth-Incoming-Port'
-      - Direct Bluetooth RFCOMM URIs: 'bt://00:11:22:33:44:55:1' or 'rfcomm://00:11:22:33:44:55:1'
-      - Bluetooth Low Energy (BLE) URIs: 'ble://00:11:22:33:44:55'
-      - Wi-Fi / Ethernet TCP/IP URIs: 'tcp://192.168.1.50:5000' or 'socket://192.168.1.50:5000'
-      - UDP URIs: 'udp://127.0.0.1:9000'
-      - Built-in Virtual Emulators: 'SIMULATOR', 'VIRT-LEICA', 'VIRT-TOPCON', 'VIRT-SOKKIA', 'VIRT-TRIMBLE', 'BT-SIM-LEICA', 'TCP-SIM-STATION'
-    """
     port: str = "COM1"
     baudrate: int = 19200
     bytesize: int = 8
@@ -98,12 +105,13 @@ class SerialConfig:
     flow_control: str = "NONE"   # 'NONE', 'RTSCTS', 'XONXOFF'
     verify_bcc: bool = False
     check_barrel_reversal: bool = False
+    prism_constant_mm: float = 17.0
 
 
 def dms_encoded_to_radians(dms_val: float) -> float:
     """
     Converts packed DDDMMSS or DDD.MMSS values into radians.
-    Matches FUN_004cdb10 & FUN_004c8400 in edmwin.exe.
+    Matches FUN_004cdb10 & FUN_004c8400 in edmwin.exe and dms_to_decdeg in surf3-edm.
     """
     sign = -1.0 if dms_val < 0 else 1.0
     val = abs(dms_val)
@@ -122,9 +130,9 @@ def dms_encoded_to_radians(dms_val: float) -> float:
     return math.radians(decimal_deg)
 
 
-def radians_to_dddmmss(angle_rad: float) -> float:
+def radians_to_dddmmss(angle_rad: float, truncate_seconds: bool = False) -> float:
     """
-    Exact replica of FUN_004c8400 + FUN_004c8540 in edmwin.exe:
+    Exact replica of FUN_004c8400 + FUN_004c8540 in edmwin.exe & decimal_degrees_to_dddmmss in surf3-edm:
     1. FUN_004c8400: decimal_deg = (angle_rad / (2*pi)) * 360.0
     2. FUN_004c8540: decomposes decimal_deg into Deg + Min/100 + Sec/10000 (DDD.MMSS).
     """
@@ -132,7 +140,10 @@ def radians_to_dddmmss(angle_rad: float) -> float:
     deg = int(decimal_deg)
     rem_sec = (decimal_deg - deg) * 3600.0
     minutes = int(rem_sec // 60.0)
-    seconds = int(round(rem_sec - minutes * 60.0))
+    if truncate_seconds:
+        seconds = int((rem_sec - minutes * 60.0) + 1e-9)
+    else:
+        seconds = int(round(rem_sec - minutes * 60.0))
     if seconds >= 60:
         seconds -= 60
         minutes += 1
@@ -166,7 +177,7 @@ def format_dddmmss_8digit(ddd_mmss: float) -> str:
 def format_dddmmss_7digit(ddd_mmss: float) -> str:
     """
     Formats DDD.MMSS into a 7-digit integer string 'DDDMMSS' (3-digit deg, 2-digit min, 2-digit sec)
-    matching FUN_004cdb10 for Topcon and Sokkia horizontal angle presetting.
+    matching FUN_004cdb10 for Topcon, Nikon, and Sokkia horizontal angle presetting.
     """
     rad = dms_encoded_to_radians(ddd_mmss)
     dec_deg = math.degrees(rad) % 360.0
@@ -184,7 +195,7 @@ def format_dddmmss_7digit(ddd_mmss: float) -> str:
 
 
 def compute_topcon_bcc(payload: str) -> str:
-    """Computes XOR Block Check Character (BCC) for Topcon standard frames."""
+    """Computes XOR Block Check Character (BCC) for Topcon standard frames (2-digit hex)."""
     bcc = 0
     for ch in payload:
         bcc ^= ord(ch)
@@ -193,14 +204,40 @@ def compute_topcon_bcc(payload: str) -> str:
 
 def compute_topcon_bcc_decimal3(payload: str) -> str:
     """
-    Replicates FUN_004c57d0 in edmwin.exe:
-    Computes the 3-digit decimal ASCII parity/BCC suffix used on Topcon GTS-3B/t60 frames
-    (e.g., '?+00002413m0893100+0000000d+00002413t60+00+25107' -> '107').
+    Replicates FUN_004c57d0 in edmwin.exe & make_bcc_topcon in surf3-edm (totalstation.py:854):
+    Computes the 3-digit decimal ASCII parity/BCC suffix used on Topcon frames.
     """
     bcc = 0
     for ch in payload:
         bcc ^= ord(ch)
     return f"{bcc:03d}"
+
+
+def compute_nikon_checksum(buf: str) -> str:
+    """
+    Exact replica of nikon_checksum in surf3-edm (totalstation.py:1114 & test_nikon_bcc.py):
+    Lower byte of sum of ASCII codes, modulo 0x40, plus 0x20.
+    """
+    total = sum(ord(c) for c in buf)
+    s = total & 0xFF
+    return chr((s % 0x40) + 0x20)
+
+
+def wrap_nikon_command(inner_cmd: str) -> str:
+    """Wraps a Nikon command body (e.g. '$DNX' or '$MSR') in SOH + 'CT\\x02...\\x03' + BCC + EOT + CRLF."""
+    body = f"CT\x02{inner_cmd}\x03"
+    chk = compute_nikon_checksum(body)
+    return f"\x01{body}{chk}\x04\r\n"
+
+
+def compute_sokkia_checksum(buf: str) -> str:
+    """
+    Exact replica of sokkia_checksum in surf3-edm (totalstation.py:1178 & test_sokkia_checksum.py):
+    Two's complement of the sum of ASCII codes, formatted as 2 uppercase hex digits.
+    """
+    total = sum(ord(c) for c in buf)
+    twos_comp = total & 0xFF
+    return f"{twos_comp:02X}"
 
 
 # ==============================================================================
@@ -210,9 +247,7 @@ def compute_topcon_bcc_decimal3(payload: str) -> str:
 class _SocketStreamAdapter:
     """
     Wraps a Python `socket.socket` (TCP/IP, UDP, or Bluetooth RFCOMM `AF_BLUETOOTH`)
-    in a pyserial-compatible interface (`is_open`, `write`, `read`, `in_waiting`, `close`,
-    `reset_input_buffer`, `reset_output_buffer`) so all TotalStationDriver subclasses
-    work identically over Serial, Bluetooth RFCOMM, Wi-Fi TCP, or UDP!
+    in a pyserial-compatible interface.
     """
 
     def __init__(
@@ -283,15 +318,6 @@ class _SocketStreamAdapter:
 
 
 def parse_transport_endpoint(port_spec: str) -> Dict[str, Any]:
-    """
-    Parses a connection string/URI into structured transport metadata:
-      - 'bt://AA:BB:CC:DD:EE:FF:1' or 'rfcomm://AA:BB:CC:DD:EE:FF:1' -> {'scheme': 'BT_RFCOMM', 'address': 'AA:BB:CC:DD:EE:FF', 'channel': 1}
-      - 'ble://AA:BB:CC:DD:EE:FF' -> {'scheme': 'BLE_UART', 'address': 'AA:BB:CC:DD:EE:FF'}
-      - 'tcp://192.168.1.100:5000' or 'socket://192.168.1.100:5000' -> {'scheme': 'TCP', 'host': '192.168.1.100', 'port': 5000}
-      - 'udp://127.0.0.1:5005' -> {'scheme': 'UDP', 'host': '127.0.0.1', 'port': 5005}
-      - 'SIMULATOR' / 'VIRT-*' / 'BT-SIM-*' / 'TCP-SIM-*' -> {'scheme': 'VIRTUAL', 'port': port_spec}
-      - 'COM3' / '/dev/ttyUSB0' -> {'scheme': 'SERIAL', 'port': port_spec}
-    """
     raw = (port_spec or "").strip()
     upper = raw.upper()
 
@@ -333,15 +359,6 @@ def parse_transport_endpoint(port_spec: str) -> Dict[str, Any]:
 
 
 def discover_bluetooth_devices() -> List[Tuple[str, str]]:
-    """
-    Discovers paired and nearby Bluetooth Total Stations / Serial Adapters across platforms:
-    1. Scans OS serial ports (`serial.tools.list_ports.comports()`) for Bluetooth SPP
-       descriptions (`Bluetooth`, `BTHENUM`, `SPP`, `RFCOMM`, `Parani`, `RN42`, `Leica`, `Topcon`, `Sokkia`, `Trimble`).
-    2. On Windows, queries `Get-PnpDevice -Class Bluetooth` (PowerShell) to surface paired
-       Bluetooth survey instruments and their MAC addresses even before a COM port is opened.
-    3. Includes virtual Bluetooth & Wi-Fi test endpoints (`BT-SIM-LEICA`, `BT-SIM-TOPCON`, `TCP-SIM-STATION`)
-       so Bluetooth and network workflows can be tested without physical hardware.
-    """
     found: List[Tuple[str, str]] = []
     seen_ids: set[str] = set()
 
@@ -424,6 +441,8 @@ class TotalStationDriver(abc.ABC):
         self._log_callback = log_callback
         self._virtual_connected: bool = self.is_virtual_port(config.port)
         self._sim_rng = random.Random(42)
+        self.using_prism: bool = True
+        self.prism_constant_mm: float = config.prism_constant_mm
 
     @staticmethod
     def is_virtual_port(port_name: str) -> bool:
@@ -513,7 +532,6 @@ class TotalStationDriver(abc.ABC):
             return
 
         if scheme == "BLE_UART":
-            # Support pyserial url handler if registered, or raise descriptive BLE guidance
             if HAS_PYSERIAL and hasattr(serial, "serial_for_url"):
                 try:
                     self._serial = serial.serial_for_url(self.config.port, timeout=self.config.timeout)
@@ -550,7 +568,7 @@ class TotalStationDriver(abc.ABC):
         self._virtual_connected = False
 
     def reset_connection(self) -> None:
-        """Implements Station -> Reset Connection (FUN_005369d0)."""
+        """Implements Station -> Reset Connection (FUN_005369d0 & F12 in surf3-edm)."""
         self.disconnect()
         self.connect()
         self.initialize_station_comm()
@@ -579,6 +597,20 @@ class TotalStationDriver(abc.ABC):
                 return "%R1P,0,0:0,2026,'10','28','16','45','00'\r\n"
             if ",5004" in cmd:
                 return '%R1P,0,0:0,"TPS1200+ Virtual Emulator"\r\n'
+            if ",17022:" in cmd:
+                return f"%R1P,0,0:0,{0 if self.using_prism else 1}\r\n"
+            if ",2023:" in cmd:
+                return f"%R1P,0,0:0,{self.prism_constant_mm / 1000.0:.4f}\r\n"
+            if ",2029:" in cmd:
+                return "%R1P,0,0:0,0.000284,1013.25,20.0,15.0\r\n"
+            if ",2151:" in cmd:
+                return "%R1P,0,0:0,0.000\r\n"
+            if ",2009:" in cmd:
+                return "%R1P,0,0:0,100.000,100.000,10.000,1.500\r\n"
+            if ",2011:" in cmd:
+                return "%R1P,0,0:0,1.500\r\n"
+            if ",2107:" in cmd:
+                return f"%R1P,0,0:0,{hz_rad:.8f},{v_rad:.8f}\r\n"
             if ",2187:" in cmd:
                 tokens = (
                     ["0"] + ["0.0000"] * 10 + ["0.0042", "0.0000"]
@@ -589,7 +621,15 @@ class TotalStationDriver(abc.ABC):
                 return f"%R1P,0,0:0,{hz_rad:.8f},{v_rad:.8f},{sd:.4f}\r\n"
             return "%R1P,0,0:0\r\n"
 
-        # 2. Leica / Wild GSI-8 / GSI-16 & Builder 209 commands
+        # 2. GeoMax commands
+        if cmd == "meas/all" or isinstance(self, GeoMaxDriver):
+            if cmd.startswith("SET/"):
+                return "*\r\n"
+            hz_gon = hz_deg * 200.0 / 180.0
+            v_gon = v_deg * 200.0 / 180.0
+            return f"{sd:.4f},{hz_gon:.5f},{v_gon:.5f}\r\n"
+
+        # 3. Leica / Wild GSI-8 / GSI-16 & Builder 209 commands
         if cmd.startswith("SET/") or cmd.startswith("PUT/") or cmd.startswith("/Dc"):
             return "*\r\n"
         if cmd.startswith("GET/M/") or cmd == "$MSR":
@@ -598,21 +638,37 @@ class TotalStationDriver(abc.ABC):
             sd_mm = int(round(sd * 1000))
             return f"110001+00000001 21.323+{hz_gsi:08d} 22.323+{v_gsi:08d} 31..00+{sd_mm:08d}\r\n"
 
-        # 3. Trimble M3 / Geodimeter 5600 / S-Series GDS commands
+        # 4. Native Nikon CT\x02...\x03 frames
+        if "CT\x02" in data or isinstance(self, NikonDriver):
+            if "?PSM" in data:
+                return f"TC\x06\r\n?PSM:+{int(round(self.prism_constant_mm)):03d}\x03\r\n"
+            if "?HAN" in data:
+                hz_7 = format_dddmmss_7digit(radians_to_dddmmss(hz_rad))
+                return f"TC\x06\r\n:HA0{hz_7}0\x03\r\n"
+            if "?CND" in data:
+                return "TC\x06\r\nCT\x02?CND00000000H0MDVX0000S\x03\r\n"
+            if "$MSR" in data or isinstance(self, NikonDriver):
+                sd_10000 = int(round(sd * 10000))
+                hz_7 = format_dddmmss_7digit(radians_to_dddmmss(hz_rad))
+                v_7 = format_dddmmss_7digit(radians_to_dddmmss(v_rad))
+                return f"SD+{sd_10000:08d} HA+0{hz_7}0 VA+0{v_7}0\r\n"
+            return "TC\x06\r\n"
+
+        # 5. Trimble M3 / Geodimeter 5600 / S-Series GDS commands
         if cmd.startswith("RG") or isinstance(self, TrimbleM3Driver):
             hz_dms = radians_to_dddmmss(hz_rad)
             v_dms = radians_to_dddmmss(v_rad)
             return f"37={hz_dms:.4f}\r\n38={v_dms:.4f}\r\n39={sd:.4f}\r\n"
 
-        # 4. Zeiss Elta / REC-500 commands
+        # 6. Zeiss Elta / REC-500 commands
         if isinstance(self, ZeissRec500Driver):
             hz_dms = radians_to_dddmmss(hz_rad)
             v_dms = radians_to_dddmmss(v_rad)
             return f"0001  SD {sd:8.4f}  Hz {hz_dms:8.4f}  V {v_dms:8.4f}\r\n"
 
-        # 5. Topcon GTS / GM Series commands
-        if "\x06R" in data or cmd.startswith("!HAN"):
-            return "\x06\r\n"
+        # 7. Topcon GTS / GM Series commands
+        if "\x06R" in data or cmd.startswith("J+") or cmd.startswith("!HAN"):
+            return "\x06006\x03\r\n"
         if "\x15?" in data or isinstance(self, TopconDriver):
             sd_mm = int(round(sd * 1000))
             v_dms = format_dddmmss_7digit(radians_to_dddmmss(v_rad))
@@ -621,14 +677,14 @@ class TotalStationDriver(abc.ABC):
             bcc = compute_topcon_bcc(body)
             return f"{body}{bcc}\r\n"
 
-        # 6. Microscribe 3D Digitizer commands
+        # 8. Microscribe 3D Digitizer commands
         if cmd.upper() == "GETPOS" or isinstance(self, MicroscribeDriver):
             x_mm = round(100400.0 + self._sim_rng.uniform(50.0, 950.0), 2)
             y_mm = round(100400.0 + self._sim_rng.uniform(50.0, 950.0), 2)
             z_mm = round(9850.0 + self._sim_rng.uniform(-150.0, 150.0), 2)
             return f"{x_mm}, {y_mm}, {z_mm}\r\n"
 
-        # 7. Sokkia / Nikon SET Series commands
+        # 9. Sokkia / Nikon SET Series commands
         if "\x11" in data or isinstance(self, SokkiaNikonDriver):
             sd_mm = int(round(sd * 1000))
             v_dms = format_dddmmss_7digit(radians_to_dddmmss(v_rad))
@@ -685,6 +741,12 @@ class TotalStationDriver(abc.ABC):
         """Returns the exact wire string to set the horizontal circle on this station."""
         return ""
 
+    def toggle_prism_reflectorless(self) -> str:
+        """Toggles between Prism and Reflectorless mode on supported stations (Nikon & Leica GeoCOM)."""
+        self.using_prism = not self.using_prism
+        mode_str = "Prism" if self.using_prism else "Reflectorless"
+        return f"Using\n{mode_str}\n{self.prism_constant_mm if self.using_prism else 0.0:.1f} mm\nconstant"
+
     @abc.abstractmethod
     def measure(self) -> RawObservation:
         """Triggers measurement and returns parsed RawObservation."""
@@ -696,13 +758,19 @@ class TotalStationDriver(abc.ABC):
 
 class LeicaGeoCOMDriver(TotalStationDriver):
     """
-    Driver for Leica WILD2 / GeoCOM Total Stations (FUN_004c7de0, FUN_004cad10, FUN_004c8840).
+    Driver for Leica WILD2 / GeoCOM Total Stations (FUN_004c7de0, FUN_004cad10, FUN_004c8840,
+    and surf3-edm totalstation.py:1352-1610).
     """
 
     NULL_CHECK_CMD = "%R1Q,0:\r\n"
     SET_PRISM_CMD = "%R1Q,17021:0\r\n"
+    SET_REFLECTORLESS_CMD = "%R1Q,17021:1\r\n"
+    GET_TARGET_TYPE_CMD = "%R1Q,17022:\r\n"
+    GET_PRISM_CONST_CMD = "%R1Q,2023:\r\n"
+    STOP_CLEAR_CMD = "%R1Q,2008:3,1\r\n"
     DO_MEASURE_CMD = "\r\n%R1Q,2008:1,1\r\n"
     GET_SIMPLE_MEA_CMD = "%R1Q,2108:10000,1\r\n"
+    GET_ANGLE_CMD = "%R1Q,2107:1\r\n"
     GET_DATETIME_CMD = "%R1Q,5008:\r\n"
     GET_INSTR_NAME_CMD = "%R1Q,5004,6,21341:\r\n"
 
@@ -710,9 +778,59 @@ class LeicaGeoCOMDriver(TotalStationDriver):
         rx = self.send_raw(self.SET_PRISM_CMD)
         return rx
 
+    def stop_and_clear(self) -> str:
+        """Replicates stop_and_clear_geocom (%R1Q,2008:3,1) in surf3-edm."""
+        return self.send_raw(self.STOP_CLEAR_CMD)
+
     def format_set_horizontal_angle_cmd(self, angle_dddmmss: float) -> str:
         rad = dms_encoded_to_radians(angle_dddmmss) % (2.0 * math.pi)
         return f"%R1Q,2113:{rad:.7f}\r\n"
+
+    def set_horizontal_angle(self, angle_dddmmss: float) -> str:
+        self.stop_and_clear()
+        return super().set_horizontal_angle(angle_dddmmss)
+
+    def fetch_horizontal_angle_dddmmss(self) -> float:
+        """Replicates fetch_hangle_leica_geocom (%R1Q,2107:1) in surf3-edm."""
+        self.stop_and_clear()
+        rx = self.send_raw(self.GET_ANGLE_CMD)
+        if ":" not in rx:
+            raise ValueError(f"Malformed GeoCOM angle response: {rx!r}")
+        _, payload = rx.strip().split(":", 1)
+        tokens = [t.strip() for t in payload.split(",")]
+        if len(tokens) < 2:
+            raise ValueError(f"Invalid GeoCOM angle response: {rx!r}")
+        rc = int(tokens[0])
+        acceptable = {0, 1285, 1289, 1288, 1292, 1291, 1293, 8, 12}
+        if rc not in acceptable:
+            msg = LEICA_GEOCOM_ERRORS.get(rc, f"GeoCOM error {rc}")
+            raise RuntimeError(msg)
+        hz_rad = float(tokens[1]) % (2.0 * math.pi)
+        return radians_to_dddmmss(hz_rad)
+
+    def toggle_prism_reflectorless(self) -> str:
+        """Replicates prism_vs_reflectorless_geocom in surf3-edm."""
+        if self.using_prism:
+            self.send_raw(self.SET_REFLECTORLESS_CMD)
+            self.using_prism = False
+        else:
+            self.send_raw(self.SET_PRISM_CMD)
+            self.using_prism = True
+        try:
+            rx = self.send_raw(self.GET_PRISM_CONST_CMD)
+            if ":" in rx:
+                vals = rx.strip().split(":", 1)[1].split(",")
+                if len(vals) >= 2 and int(vals[0]) == 0:
+                    self.prism_constant_mm = round(float(vals[1]) * 1000.0, 1)
+        except Exception:
+            pass
+        mode = "Prism" if self.using_prism else "Reflectorless"
+        return f"Using\n{mode}\n{self.prism_constant_mm:.1f} mm\nconstant"
+
+    def upload_station_coordinates(self, x: float, y: float, z: float, hi: float = 0.0) -> str:
+        """Replicates upload_station_coordinates_geocom (%R1Q,2010:x,y,z,hi) in surf3-edm."""
+        cmd = f"%R1Q,2010:{x:.3f},{y:.3f},{z:.3f},{hi:.3f}\r\n"
+        return self.send_raw(cmd)
 
     def query_datetime(self) -> str:
         """Implements frmDebug 'Get date/time' (FUN_004cc370)."""
@@ -727,7 +845,9 @@ class LeicaGeoCOMDriver(TotalStationDriver):
         if "%R1P" in ack and not ack.strip().endswith(":0"):
             parts = ack.strip().split(":")
             if len(parts) > 1 and parts[-1] != "0":
-                raise RuntimeError(f"Leica GeoCOM TMC_DoMeasure error code: {parts[-1]}")
+                rc = int(parts[-1].split(",")[0]) if parts[-1].split(",")[0].lstrip("-").isdigit() else -1
+                err_txt = LEICA_GEOCOM_ERRORS.get(rc, f"Leica GeoCOM TMC_DoMeasure error code: {parts[-1]}")
+                raise RuntimeError(err_txt)
         rx = self.send_raw(self.GET_SIMPLE_MEA_CMD)
         return self.parse_response(rx, tx_cmd=self.DO_MEASURE_CMD.strip() + " ; " + self.GET_SIMPLE_MEA_CMD.strip())
 
@@ -745,7 +865,8 @@ class LeicaGeoCOMDriver(TotalStationDriver):
 
         rc = int(tokens[0])
         if rc != 0:
-            raise RuntimeError(f"Leica GeoCOM RPC error code: {rc}")
+            err_txt = LEICA_GEOCOM_ERRORS.get(rc, f"Leica GeoCOM RPC error code: {rc}")
+            raise RuntimeError(err_txt)
 
         hz_rad = float(tokens[1]) % (2.0 * math.pi)
         v_rad = float(tokens[2])
@@ -801,10 +922,6 @@ class LeicaAutoTiltDriver(LeicaGeoCOMDriver):
         return self.parse_response(meas_rx, tx_cmd=self.GET_MEA_WITH_TILT_CMD.strip())
 
     def parse_response(self, response: str, tx_cmd: str = "") -> RawObservation:
-        """
-        Replicates FUN_004cd440:
-        Parses %R1P,0,0:RC,t2,t3,...,t12(tilt),t13,t14(Hz),t15(V),t16(SD)...
-        """
         clean = response.strip()
         if ":" not in clean:
             raise ValueError(f"Malformed AutoTilt response: {response!r}")
@@ -873,6 +990,7 @@ class LeicaGSIDriver(TotalStationDriver):
         hz_rad: Optional[float] = None
         v_rad: Optional[float] = None
         slope_dist: Optional[float] = None
+        prism_const_m: float = 0.0
 
         for word in words:
             w = word.lstrip("*")
@@ -883,6 +1001,13 @@ class LeicaGSIDriver(TotalStationDriver):
             sign_char = w[6]
             raw_digits = w[7:]
             sign = -1.0 if sign_char == "-" else 1.0
+
+            if wi == "51":
+                try:
+                    prism_const_m = float(w[-4:]) / 1000.0
+                except ValueError:
+                    pass
+                continue
 
             if not raw_digits.isdigit():
                 continue
@@ -926,6 +1051,7 @@ class LeicaGSIDriver(TotalStationDriver):
             slope_distance=slope_dist,
             horizontal_angle_rad=hz_rad,
             vertical_angle_rad=v_rad,
+            tilt_compensation=prism_const_m,
             raw_tx=tx_cmd,
             raw_rx=response,
         )
@@ -943,20 +1069,70 @@ class LeicaBuilderDriver(LeicaGSIDriver):
         return f"/Dc {angle_dddmmss:.4f}\r\n"
 
 
+class GeoMaxDriver(TotalStationDriver):
+    """
+    Driver for GeoMax Total Stations (replicates surf3-edm totalstation.py:1299):
+    - Init: 'SET/distance_unit/0\\r\\n' and 'SET/angle_unit/1\\r\\n'
+    - Trigger: 'meas/all\\r\\n'
+    - Set Horizontal Angle: 'SET/hz_angle/{rad:10.8f}\\r\\n'
+    - Parses 'sloped,hangle_gon,vangle_gon'
+    """
+
+    TRIGGER_CMD = "meas/all\r\n"
+
+    def initialize_station_comm(self) -> str:
+        r1 = self.send_raw("SET/distance_unit/0\r\n")
+        r2 = self.send_raw("SET/angle_unit/1\r\n")
+        return f"{r1.strip()} {r2.strip()}".strip()
+
+    def format_set_horizontal_angle_cmd(self, angle_dddmmss: float) -> str:
+        rad = dms_encoded_to_radians(angle_dddmmss) % (2.0 * math.pi)
+        return f"SET/hz_angle/{rad:10.8f}\r\n"
+
+    def measure(self) -> RawObservation:
+        rx = self.send_raw(self.TRIGGER_CMD)
+        return self.parse_response(rx, tx_cmd="meas/all")
+
+    def parse_response(self, response: str, tx_cmd: str = "") -> RawObservation:
+        clean = response.strip()
+        parts = [p.strip() for p in clean.split(",") if p.strip()]
+        if len(parts) != 3:
+            raise ValueError(f"Invalid GeoMax response frame: {response!r}")
+        sd_val = float(parts[0])
+        hz_deg = float(parts[1]) * 180.0 / 200.0
+        v_deg = float(parts[2]) * 180.0 / 200.0
+        return RawObservation(
+            slope_distance=sd_val,
+            horizontal_angle_rad=math.radians(hz_deg) % (2.0 * math.pi),
+            vertical_angle_rad=math.radians(v_deg),
+            raw_tx=tx_cmd,
+            raw_rx=response,
+        )
+
+
 class TopconDriver(TotalStationDriver):
     """
     Driver for Topcon GTS-3, GTS-210, GTS-220, GTS-301/302/303, GTS-320, and GM-55.
     Supports both standard Topcon frames (?+0012345m+0900000d+1800000d...) and
     EDMWin GTS-3B/t60 frames (?+00002413m0893100+0000000d+00002413t60+00+25107),
-    including BCC checksum verification (FUN_004c57d0) and barrel-reversal checks.
+    including BCC checksum verification (FUN_004c57d0), 'J+<angle>d<bcc>' H-angle setting,
+    ACK ('\\x06006\\x03\\r\\n'), and barrel-reversal checks.
     """
 
     TRIGGER_CMD = "\x06R\x03\r\n"
     READ_CMD = "\x15?\x03\r\n"
+    ACK_CMD = "\x06006\x03\r\n"
+
+    @staticmethod
+    def format_topcon_command(cmd_body: str) -> str:
+        """Formats a Topcon command with 3-digit decimal XOR BCC + ETX + CRLF (totalstation.py:884)."""
+        bcc = compute_topcon_bcc_decimal3(cmd_body)
+        return f"{cmd_body}{bcc}\x03\r\n"
 
     def format_set_horizontal_angle_cmd(self, angle_dddmmss: float) -> str:
-        digits8 = format_dddmmss_8digit(angle_dddmmss)
-        return f"!HAN{digits8}\r\n"
+        """Replicates surf3-edm set_horizontal_angle_topcon: 'J+<dddmmss>d<BCC>\\x03\\r\\n'."""
+        digits7 = format_dddmmss_7digit(angle_dddmmss)
+        return self.format_topcon_command(f"J+{digits7}d")
 
     def measure(self) -> RawObservation:
         self.send_raw(self.TRIGGER_CMD)
@@ -990,6 +1166,15 @@ class TopconDriver(TotalStationDriver):
         if not clean:
             raise ValueError("ERROR: Shot could not be recorded. Verify that prism is visible.")
 
+        # Extract optional GTS-3B/t60 prism offset at [43:48] (0x004cab78 & surf3-edm totalstation.py:914)
+        raw_full = response.strip().lstrip("\x00\x06\x15\x02")
+        prism_off_m = 0.0
+        if len(raw_full) >= 45 and raw_full[0] in ("?", "R"):
+            try:
+                prism_off_m = float(raw_full[42:45]) / 1000.0
+            except ValueError:
+                pass
+
         packed_pattern = re.compile(
             r"([+-]?\d+)([mfMF])([+-]?\d+)[dD]?([+-]\d+)([dD]?)"
         )
@@ -1018,6 +1203,7 @@ class TopconDriver(TotalStationDriver):
                 slope_distance=sd_val,
                 horizontal_angle_rad=hz_rad,
                 vertical_angle_rad=v_rad,
+                tilt_compensation=prism_off_m,
                 raw_tx=tx_cmd,
                 raw_rx=response,
             )
@@ -1038,10 +1224,124 @@ class TopconDriver(TotalStationDriver):
         raise ValueError(f"Unrecognized Topcon frame format: {response!r}")
 
 
+class NikonDriver(TotalStationDriver):
+    """
+    Native Nikon DTM / NPL / Nivo Driver (replicates edmwin.exe 0x004c897f & surf3-edm totalstation.py:934):
+    - Uses SOH + 'CT\\x02<CMD>\\x03' + nikon_checksum + EOT + CRLF framing
+    - Supports Prism (!TGTP) vs. Reflectorless (!TGTN) mode and !PSM / ?PSM prism constant (mm)
+    - Parses 'SD<10000ths_m> HA<ddddmmss> VA<ddddmmss>' frames (dividing SD by 10000.0)
+    - Also accepts legacy Sokkia/SET space-delimited responses for dual-mode compatibility
+    """
+
+    def initialize_station_comm(self) -> str:
+        rx = self.send_raw(wrap_nikon_command("$DNX"))
+        self.set_prism_mode()
+        return rx
+
+    def set_prism_constant(self, constant_mm: float) -> str:
+        c_int = int(round(float(constant_mm)))
+        c_str = f"-{abs(c_int):03d}" if c_int < 0 else f"0{abs(c_int):03d}"
+        self.prism_constant_mm = float(c_int)
+        return self.send_raw(wrap_nikon_command(f"!PSM{c_str}"))
+
+    def get_prism_constant(self) -> float:
+        rx = self.send_raw(wrap_nikon_command("?PSM"))
+        if ":" in rx:
+            val_part = rx.split(":", 1)[1]
+            m = re.search(r"([+-]?\d+)", val_part)
+            if m:
+                self.prism_constant_mm = float(m.group(1))
+        return self.prism_constant_mm
+
+    def set_prism_mode(self) -> str:
+        self.using_prism = True
+        self.send_raw(wrap_nikon_command("!TGTP"))
+        return self.set_prism_constant(self.prism_constant_mm)
+
+    def set_reflectorless_mode(self) -> str:
+        self.using_prism = False
+        self.send_raw(wrap_nikon_command("!TGTN"))
+        return self.set_prism_constant(0.0)
+
+    def toggle_prism_reflectorless(self) -> str:
+        if self.using_prism:
+            self.set_reflectorless_mode()
+            return "Using\nReflectorless\n0.0 mm\nconstant"
+        self.set_prism_mode()
+        return f"Using\nPrism\n{self.prism_constant_mm:.1f} mm\nconstant"
+
+    def format_set_horizontal_angle_cmd(self, angle_dddmmss: float) -> str:
+        digits7 = format_dddmmss_7digit(angle_dddmmss)
+        return wrap_nikon_command(f"!HAN{digits7}")
+
+    def measure(self) -> RawObservation:
+        cmd = wrap_nikon_command("$MSR")
+        rx = self.send_raw(cmd)
+        return self.parse_response(rx, tx_cmd=cmd.strip())
+
+    def parse_response(self, response: str, tx_cmd: str = "") -> RawObservation:
+        clean = response.strip()
+        if ":" in clean and ("SD" in clean or "HA" in clean):
+            clean = clean.split(":", 1)[1].strip()
+        clean = clean.split("\x03", 1)[0].strip()
+
+        sd_val: Optional[float] = None
+        hz_rad: Optional[float] = None
+        v_rad: Optional[float] = None
+
+        for tok in clean.replace(",", " ").split():
+            if tok.startswith("SD") and len(tok) > 2:
+                raw_num = tok[2:].lstrip(":+")
+                sd_val = float(raw_num) / 10000.0
+            elif tok.startswith(("HA", "HZ")) and len(tok) > 2:
+                raw_a = tok[2:].lstrip(":+")
+                if "." in raw_a:
+                    hz_rad = dms_encoded_to_radians(float(raw_a)) % (2.0 * math.pi)
+                elif len(raw_a) >= 8:
+                    # 4-digit deg (0ddd), 2-digit min (mm), 2-digit sec (ss), optional 1-digit tenth
+                    deg = int(raw_a[:4])
+                    mins = int(raw_a[4:6])
+                    secs_str = raw_a[6:8] + ("." + raw_a[8:] if len(raw_a) > 8 else "")
+                    secs = float(secs_str)
+                    hz_rad = math.radians(deg + mins / 60.0 + secs / 3600.0) % (2.0 * math.pi)
+                elif len(raw_a) == 7:
+                    deg = int(raw_a[:3])
+                    mins = int(raw_a[3:5])
+                    secs = float(raw_a[5:7])
+                    hz_rad = math.radians(deg + mins / 60.0 + secs / 3600.0) % (2.0 * math.pi)
+            elif tok.startswith("VA") and len(tok) > 2:
+                raw_v = tok[2:].lstrip(":+")
+                if "." in raw_v:
+                    v_rad = dms_encoded_to_radians(float(raw_v))
+                elif len(raw_v) >= 8:
+                    deg = int(raw_v[:4])
+                    mins = int(raw_v[4:6])
+                    secs_str = raw_v[6:8] + ("." + raw_v[8:] if len(raw_v) > 8 else "")
+                    secs = float(secs_str)
+                    v_rad = math.radians(deg + mins / 60.0 + secs / 3600.0)
+                elif len(raw_v) == 7:
+                    deg = int(raw_v[:3])
+                    mins = int(raw_v[3:5])
+                    secs = float(raw_v[5:7])
+                    v_rad = math.radians(deg + mins / 60.0 + secs / 3600.0)
+
+        if sd_val is not None and hz_rad is not None and v_rad is not None:
+            return RawObservation(
+                slope_distance=sd_val,
+                horizontal_angle_rad=hz_rad,
+                vertical_angle_rad=v_rad,
+                raw_tx=tx_cmd,
+                raw_rx=response,
+            )
+
+        return SokkiaNikonDriver(self.config, self._log_callback, variant="NIKON_SET").parse_response(response, tx_cmd)
+
+
 class SokkiaNikonDriver(TotalStationDriver):
     """
-    Driver for Sokkia SET 4B / CX / SX / iX and Nikon DTM / NPL / Nivo Total Stations.
-    Triggers measurement with DC1 (0x11) or '$DNX' and aborts with DC2 (0x12).
+    Driver for Sokkia SET 4B / CX / SX / iX and Nikon (SET mode) Total Stations.
+    Triggers measurement with DC1 (0x11) and aborts with DC2 (0x12).
+    Supports both legacy EDMWin 8-digit H-angle setting and surf3-edm '/Dc <ddd.mmss>,<chk>\\r\\n'.
     """
 
     TRIGGER_CMD = "\x11\r\n"
@@ -1051,12 +1351,19 @@ class SokkiaNikonDriver(TotalStationDriver):
         self,
         config: SerialConfig,
         log_callback: Optional[Callable[[str, str], None]] = None,
-        variant: str = "NIKON",
+        variant: str = "SOKKIA",
     ) -> None:
         super().__init__(config, log_callback)
         self.variant = variant.strip().upper()
 
     def format_set_horizontal_angle_cmd(self, angle_dddmmss: float) -> str:
+        if "SET" in self.variant:
+            rad = dms_encoded_to_radians(angle_dddmmss)
+            dms_val = radians_to_dddmmss(rad)
+            deg_i = int(dms_val)
+            frac_s = f"{dms_val:.4f}".split(".")[1]
+            cmd = f"/Dc {deg_i:03d}.{frac_s},"
+            return f"{cmd}{compute_sokkia_checksum(cmd)}\r\n"
         digits8 = format_dddmmss_8digit(angle_dddmmss)
         if self.variant == "SOKKIA":
             return f"{digits8}\r\n"
@@ -1096,13 +1403,7 @@ class SokkiaNikonDriver(TotalStationDriver):
 class TrimbleM3Driver(TotalStationDriver):
     """
     Driver for Trimble M3, Geodimeter 400/500/600, Trimble 5600, and S-Series Total Stations
-    using Geodimeter Data System (GDS) label-value ASCII protocol:
-      - Trigger measurement: 'RG=1\\r\\n'
-      - Set Horizontal Angle: '21=<DDD.MMSS>\\r\\n'
-      - Response labels:
-        * '7=<DDD.MMSS>' or '21=<DDD.MMSS>' or '37=<DDD.MMSS>' (Horizontal Angle)
-        * '8=<DDD.MMSS>' or '22=<DDD.MMSS>' or '38=<DDD.MMSS>' (Vertical Zenith Angle)
-        * '9=<meters>'   or '31=<meters>'   or '39=<meters>'   (Slope Distance)
+    using Geodimeter Data System (GDS) label-value ASCII protocol.
     """
 
     TRIGGER_CMD = "RG=1\r\n"
@@ -1147,11 +1448,7 @@ class TrimbleM3Driver(TotalStationDriver):
 
 
 class ZeissRec500Driver(TotalStationDriver):
-    """
-    Driver for Carl Zeiss Elta (R45/R50/R55/C) & REC-500 Total Stations:
-      - Trigger measurement: 'M\\r\\n'
-      - Parses Zeiss REC-500 lines such as '0001  SD  12.3450  Hz  90.1530  V  91.0000'
-    """
+    """Driver for Carl Zeiss Elta (R45/R50/R55/C) & REC-500 Total Stations."""
 
     TRIGGER_CMD = "M\r\n"
 
@@ -1231,9 +1528,7 @@ class MicroscribeDriver(TotalStationDriver):
 
 
 class SimulatorDriver(TotalStationDriver):
-    """
-    Synthetic Total Station Simulator for offline testing, training, and UI verification.
-    """
+    """Synthetic Total Station Simulator for offline testing, training, and UI verification."""
 
     def __init__(
         self,
@@ -1317,14 +1612,18 @@ def create_driver(
         return LeicaBuilderDriver(config, log_callback)
     if "wild2" in normalized or "geocom" in normalized:
         return LeicaGeoCOMDriver(config, log_callback)
+    if "geomax" in normalized:
+        return GeoMaxDriver(config, log_callback)
     if "gsi" in normalized or "wild" in normalized or "leica" in normalized:
         return LeicaGSIDriver(config, log_callback)
     if "topcon" in normalized or "gts" in normalized:
         return TopconDriver(config, log_callback)
     if "sokkia" in normalized:
         return SokkiaNikonDriver(config, log_callback, variant="SOKKIA")
-    if "nikon" in normalized or "set" in normalized:
-        return SokkiaNikonDriver(config, log_callback, variant="NIKON")
+    if "nikon (set)" in normalized or "nikon_set" in normalized or normalized == "set":
+        return SokkiaNikonDriver(config, log_callback, variant="NIKON_SET")
+    if "nikon" in normalized:
+        return NikonDriver(config, log_callback)
     if "trimble" in normalized or "geodimeter" in normalized:
         return TrimbleM3Driver(config, log_callback)
     if "zeiss" in normalized or "rec500" in normalized or "elta" in normalized:
